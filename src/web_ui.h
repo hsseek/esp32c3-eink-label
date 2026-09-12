@@ -26,8 +26,8 @@ h1 span{color:var(--mut);font-weight:400}
 .muted{color:var(--mut);font-size:13px;margin:8px 2px 0}
 .seg{display:flex;gap:6px;background:#141720;border:1px solid var(--line);border-radius:10px;padding:4px;margin-bottom:12px}
 .seg input{position:absolute;opacity:0;pointer-events:none}
-.seg label{flex:1;text-align:center;padding:9px 0;border-radius:7px;font-weight:600;font-size:14px;
-  color:var(--mut);cursor:pointer;user-select:none}
+.seg label{flex:1;min-width:0;text-align:center;padding:9px 0;border-radius:7px;font-weight:600;
+  font-size:13px;letter-spacing:.01em;white-space:nowrap;color:var(--mut);cursor:pointer;user-select:none}
 .seg input:checked+label{background:var(--acc);color:#fff}
 textarea{width:100%;min-height:88px;resize:vertical;background:#141720;color:var(--fg);
   border:1px solid var(--line);border-radius:10px;padding:11px;font:15px/1.4 inherit}
@@ -60,7 +60,7 @@ a{color:var(--acc)}
   <div class="seg">
     <input type="radio" name="mode" id="m1" value="text" checked><label for="m1">TEXT</label>
     <input type="radio" name="mode" id="m2" value="qr"><label for="m2">QR</label>
-    <input type="radio" name="mode" id="m3" value="rich"><label for="m3">TEXT+</label>
+    <input type="radio" name="mode" id="m3" value="rich"><label for="m3">UNICODE</label>
     <input type="radio" name="mode" id="m4" value="image"><label for="m4">IMAGE</label>
   </div>
   <div id="txtrow">

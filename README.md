@@ -20,9 +20,10 @@ Firmware for an **ESP32-C3 SuperMini** driving a **Waveshare 2.13" e-Paper V4**
 **Features**
 
 - **Web UI served from PROGMEM** — no CDN, no npm, no internet. One HTML string.
-- **Four modes** — TEXT (word-wrapped, 3 sizes), QR (auto version + scaling),
-  TEXT+ (emoji and any script, rasterised by your phone), IMAGE (any picture,
-  dithered to 1 bit).
+- **Four modes, two rendered on the device and two by your phone** — TEXT
+  (word-wrapped, 3 sizes) and QR (auto version + scaling) render in firmware;
+  UNICODE (emoji and any script) and IMAGE (any picture, dithered to 1 bit)
+  are rasterised by the browser. [What that changes](#where-each-mode-renders).
 - **Pixel-exact preview** before you spend a refresh — the device renders into a
   scratch buffer and ships the real bitmap back to the browser.
 - **Content survives reboots** — stored in NVS, redrawn once on boot.
@@ -150,7 +151,7 @@ showing its last content the whole time.
 **Web UI** — open the label's address:
 
 - text field for the content
-- **TEXT / QR / TEXT+ / IMAGE** tabs, each with exactly one input
+- **TEXT / QR / UNICODE / IMAGE** tabs, each with exactly one input
 - font size small / medium / large
 - **Preview** — renders and shows the result in the page *without touching the
   panel*, so you can check the wrap, the truncation or the QR size before
@@ -167,6 +168,41 @@ rejected at preview time rather than after a wasted refresh.
 Submitting content identical to what is already displayed is a no-op: the panel
 is left alone and the UI says so, rather than flashing for 2.4 s to draw the
 same thing.
+
+### Where each mode renders
+
+The four tabs fall into two families, and almost every behavioural difference
+between them follows from which family you are in.
+
+|                       | TEXT | QR | UNICODE | IMAGE |
+|-----------------------|------|----|---------|-------|
+| **Rendered by**       | the device | the device | your browser | your browser |
+| **Glyph source**      | 5 × 7 ASCII table in flash | QR modules | your phone's whole font stack | the picture you pick |
+| **Character range**   | ASCII 32–126, everything else becomes `?` | any bytes | anything Unicode | n/a |
+| **Stored in NVS as**  | the string | the string | a 3904-byte frame | a 3904-byte frame |
+| **On boot**           | re-rendered | re-rendered | blitted as-is | blitted as-is |
+| **Font size applies** | yes | no | yes | no |
+| **Preview costs**     | a round trip to the device | a round trip | nothing, the bitmap is local | nothing |
+| **Over serial**       | `TEXT:` | `QR:` | — | — |
+| **Edges**             | crisp | crisp | dithered | dithered |
+
+Three consequences are worth knowing before you pick a tab:
+
+- **Device-rendered content keeps its meaning; browser-rendered content keeps
+  its pixels.** A stored string is laid out again every boot, so changing the
+  font or `MAX_LINES` and reflashing re-flows existing TEXT content. A stored
+  frame never changes — there is no text left in it to re-flow.
+- **Only device-rendered modes work headlessly.** `TEXT:` and `QR:` over USB
+  need no browser; UNICODE and IMAGE have no serial equivalent, because the
+  serial protocol has no way to carry a frame.
+- **Only browser-rendered modes can show emoji or Hangul** — the device simply
+  has no glyphs for them.
+
+The preview asymmetry follows from the same split. For TEXT and QR the browser
+cannot know what the panel would draw, so it asks the device to render into a
+scratch buffer and send the bitmap back; that is what makes the preview exact
+rather than an approximation. For UNICODE and IMAGE the browser drew the bitmap
+in the first place, so the preview is simply that bitmap, shown instantly.
 
 **Serial** — one command per line, at 115200 baud (CR, LF or CRLF):
 
@@ -194,7 +230,7 @@ Oversized payloads are refused with a message rather than drawn as garbage:
 |------|-------|
 | TEXT | 400 characters (`MAX_TEXT_LEN`). Text that wraps past the panel height is truncated with `...` |
 | QR   | whatever fits QR version 10 at ECC-M (~270 bytes). Longer payloads are rejected — bigger versions would be too dense to scan at 122 px |
-| TEXT+ / IMAGE | exactly 3904 bytes once decoded (250 × 122, 1 bit per pixel). Anything else is rejected |
+| UNICODE / IMAGE | exactly 3904 bytes once decoded (250 × 122, 1 bit per pixel). Anything else is rejected |
 
 ### Emoji, Hangul and pictures
 
@@ -205,7 +241,7 @@ is unaffected, since it encodes raw bytes.
 Two tabs sidestep the problem by rasterising in the browser, which already has
 every font and emoji on the phone:
 
-- **TEXT+** — type anything, including emoji and Hangul. The page lays it out
+- **UNICODE** — type anything, including emoji and Hangul. The page lays it out
   with your phone's own fonts at the chosen size.
 - **IMAGE** — pick a picture. Scaled to fit and centred.
 
@@ -228,7 +264,7 @@ Three things to expect:
 
 - **The panel is 1 bit, so emoji arrive as silhouettes.** High-contrast
   pictograms (✓ ★ ♥ ⚠ ↑) read well. Detailed or pale ones often do not.
-- **TEXT+ and IMAGE are browser-only.** The serial protocol has no way to send
+- **UNICODE and IMAGE are browser-only.** The serial protocol has no way to send
   a frame, so `TEXT:` and `QR:` remain ASCII-only.
 - **Plain TEXT is still worth using for ASCII.** The device's 5 × 7 bitmap font
   is crisper on a 1-bit panel than antialiased browser text dithered down to it,
