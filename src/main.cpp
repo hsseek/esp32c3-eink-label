@@ -132,7 +132,10 @@ static uint32_t g_updates = 0;
 
 static bool     g_drawnSinceBoot   = false;
 static uint8_t  g_partialsSinceFull = 0;
-static bool     g_panelPowered     = false;  // charge pump on: partial refresh is safe
+static uint32_t g_lastPushedHash   = 0;      // of the last image actually sent
+static bool     g_havePushed        = false;
+static bool     g_lastPushChanged   = false;  // did the most recent request redraw?
+static bool     g_panelPowered      = false;  // charge pump on: partial refresh is safe
 static bool     g_panelAsleep       = true;   // controller deep-sleeping
 static uint32_t g_lastDrawMs        = 0;
 
@@ -391,7 +394,25 @@ static void displayBegin() {
 // previous draw (see PANEL_KEEP_POWERED_MS). Otherwise, and on the first draw
 // after boot, on an explicit clear, and every FULL_REFRESH_EVERY partials to
 // sweep up accumulated ghosting, we do a full refresh.
+// FNV-1a over the framebuffer. Only used to notice that a request would redraw
+// the identical image, which on this panel costs a pointless 2.4 s flash.
+static uint32_t canvasHash() {
+  const uint8_t* b = canvas.getBuffer();
+  uint32_t h = 2166136261u;
+  for (uint32_t i = 0; i < CANVAS_BYTES; i++) { h ^= b[i]; h *= 16777619u; }
+  return h;
+}
+
 static void pushCanvas(bool forceFull = false) {
+  // E-paper holds its image with no power, so redrawing what is already on the
+  // glass buys nothing and just makes the panel flash. Skip it.
+  const uint32_t hash = canvasHash();
+  if (g_havePushed && hash == g_lastPushedHash) {
+    g_lastPushChanged = false;
+    Serial.println(F("[epd] image unchanged — refresh skipped"));
+    return;
+  }
+
   const bool full = forceFull || !g_drawnSinceBoot || !g_panelPowered ||
                     (g_partialsSinceFull >= FULL_REFRESH_EVERY);
 
@@ -419,6 +440,9 @@ static void pushCanvas(bool forceFull = false) {
   else      g_partialsSinceFull++;
   g_drawnSinceBoot = true;
   g_updates++;
+  g_lastPushedHash = hash;
+  g_havePushed = true;
+  g_lastPushChanged = true;
 
   Serial.printf("[epd] %s refresh in %lu ms (%u partial since full)\n",
                 full ? "full" : "partial", (unsigned long)ms, g_partialsSinceFull);
@@ -687,7 +711,10 @@ static void sendJson(int code, const String& body) {
   server.send(code, "application/json", body);
 }
 
-static void sendOk()                    { sendJson(200, "{\"ok\":true}"); }
+static void sendOk() {
+  sendJson(200, String("{\"ok\":true,\"changed\":") +
+                (g_lastPushChanged ? "true" : "false") + "}");
+}
 static void sendErr(const String& e)    { sendJson(400, String("{\"ok\":false,\"error\":\"") + jsonEscape(e) + "\"}"); }
 
 static const char* modeName(Mode m) {

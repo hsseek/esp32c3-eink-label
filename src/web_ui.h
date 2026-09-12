@@ -124,7 +124,12 @@ function post(url,body){
   return fetch(url,{method:"POST",body:body}).then(function(r){return r.json()})
     .then(function(j){
       go.disabled=false;
-      if(j.ok){say("display updated","ok");load()}else{say(j.error,"err")}
+      if(j.ok){
+        say(j.changed===false
+              ? "no change — the panel already shows this"
+              : "display updated","ok");
+        load();
+      }else{say(j.error,"err")}
     }).catch(function(){go.disabled=false;say("request failed","err")});
 }
 

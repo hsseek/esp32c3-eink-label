@@ -95,6 +95,10 @@ showing its last content the whole time.
 - **Update display**, **Clear panel**
 - preview of exactly what is on the panel right now
 
+Submitting content identical to what is already displayed is a no-op: the panel
+is left alone and the UI says so, rather than flashing for 2.4 s to draw the
+same thing.
+
 **Serial** — one command per line, at 115200 baud:
 
 ```
@@ -148,6 +152,19 @@ Tunables at the top of `main.cpp`: `FULL_REFRESH_EVERY`, `MAX_TEXT_LEN`,
 
 An e-paper panel never reports errors — a wrong setting just leaves you with a
 white rectangle. Work down this list; the first two cover most cases.
+
+### "Update display" finished instantly and nothing flashed
+
+That is correct behaviour, not the old fault. E-paper holds its image with no
+power, so redrawing pixels that are already on the glass buys nothing and just
+costs a 2.4 s flash. The firmware hashes the rendered framebuffer and skips the
+refresh when it matches what was last drawn; the API returns
+`{"ok":true,"changed":false}` and the web UI says *"no change — the panel already
+shows this"*.
+
+The hash covers the rendered image, not the submitted text, so the same string at
+a different font size still redraws. If the UI reports a change but the glass
+does not follow, that is the real fault — see the next section.
 
 ### Ghosting, grey text, or "Update display" doing nothing
 
