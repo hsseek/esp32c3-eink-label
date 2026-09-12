@@ -1,18 +1,62 @@
 # Wi-Fi e-ink label
 
-Firmware for an **ESP32-C3 SuperMini** driving a **Waveshare 2.13" e-Paper V4**
-(SSD1680 / DEPG0213BN, 250 × 122). Set the label's content from your phone's
-browser, or over USB serial. Content is stored in NVS and redrawn on boot.
+A **2.13" e-paper name tag you retype from your phone.** Plug it into any USB-C
+port, open a page, type, tap print. The panel holds the image with no power, so
+it keeps showing your text whether or not the Wi-Fi, the router, or the firmware
+is still alive.
 
-- Web UI served from PROGMEM — no CDN, no internet needed
-- TEXT mode (word-wrapped, 3 font sizes) and QR mode (auto version + scaling)
-- Pixel-exact preview in the browser: the phone renders the same 1-bit buffer
-  that was sent to the panel
-- Partial refresh, with a full refresh every 10 updates and on first boot draw
-- Panel hibernates after every draw — never left powered idle
-- USB serial fallback: `TEXT:<string>`, `QR:<string>`, `CLEAR`
+Firmware for an **ESP32-C3 SuperMini** driving a **Waveshare 2.13" e-Paper V4**
+(SSD1680 / DEPG0213BN, 250 × 122 px). About $12 of parts and two hours.
+
+```
+┌──────────────────────────────┐
+│                              │   phone ──http──►  eink.local
+│      MEETING  IN  PROGRESS   │                        │
+│         back at 15:30        │                        ▼
+│                              │              250 × 122 · 1-bit · 2.4 s
+└──────────────────────────────┘
+```
+
+**Features**
+
+- **Web UI served from PROGMEM** — no CDN, no npm, no internet. One HTML string.
+- **Four modes** — TEXT (word-wrapped, 3 sizes), QR (auto version + scaling),
+  TEXT+ (emoji and any script, rasterised by your phone), IMAGE (any picture,
+  dithered to 1 bit).
+- **Pixel-exact preview** before you spend a refresh — the device renders into a
+  scratch buffer and ships the real bitmap back to the browser.
+- **Content survives reboots** — stored in NVS, redrawn once on boot.
+- **Zero-config networking** — captive-portal setup AP, mDNS, exponential
+  backoff, and a rescue AP if the saved network stops working.
+- **USB serial fallback** — `TEXT:`, `QR:`, `CLEAR`, plus Wi-Fi provisioning
+  without ever touching the portal.
+- **Panel-safe** — never left under drive voltage in an idle state.
+
+**Contents**
+
+[Hardware](#hardware) ·
+[Wiring](#wiring) ·
+[Build and flash](#build-and-flash) ·
+[Wi-Fi setup](#first-time-wi-fi-setup) ·
+[Using it](#using-it) ·
+[HTTP API](#http-api) ·
+[Layout](#project-layout) ·
+[Field notes](#field-notes) ·
+[Troubleshooting](#troubleshooting)
 
 ---
+
+## Hardware
+
+| Part | Notes |
+|------|-------|
+| ESP32-C3 SuperMini | Any C3 board works; the pin map below is for the SuperMini |
+| Waveshare 2.13" e-Paper **V4** | SSD1680 controller, 250 × 122. [Other revisions need a one-line change](#1-wrong-gxepd2-panel-class) |
+| Waveshare e-Paper Driver HAT *(optional)* | Or wire the FPC connector directly |
+| USB-C cable | Data, not charge-only — the same cable flashes and powers it |
+
+No battery, no level shifters, no external supply. Peak draw during a refresh is
+10–20 mA, well inside the SuperMini regulator's budget.
 
 ## Wiring
 
@@ -57,12 +101,23 @@ pio run -t upload       # build + flash over USB-C
 pio device monitor      # 115200 baud, native USB CDC
 ```
 
+Everything is pinned in [`platformio.ini`](platformio.ini) — GxEPD2, Adafruit
+GFX and ricmoo/QRCode are fetched automatically. Current footprint:
+
+```
+RAM:    15.4%  (50,308 / 327,680 bytes)
+Flash:  65.8%  (861,974 / 1,310,720 bytes)
+```
+
 The C3's native USB is USB Serial/JTAG, so a plain USB-C cable both flashes and
 carries `Serial`. That works because `platformio.ini` sets
 `-D ARDUINO_USB_CDC_ON_BOOT=1`.
 
 If upload fails to find the port, force download mode once: hold **BOOT**, tap
-**RESET**, release **BOOT**, then `pio run -t upload`.
+**RESET**, release **BOOT**, then `pio run -t upload`. On Linux, a
+`Permission denied: /dev/ttyACM0` means the udev rules are missing —
+`curl -fsSL https://raw.githubusercontent.com/platformio/platformio-core/develop/platformio/assets/system/99-platformio-udev.rules | sudo tee /etc/udev/rules.d/99-platformio-udev.rules`
+then replug.
 
 ---
 
@@ -83,6 +138,11 @@ If the saved network later fails, the firmware retries with exponential backoff
 again alongside so you can fix the credentials without a cable. The panel keeps
 showing its last content the whole time.
 
+> **If the AP never appears, or joining fails with `reason 2`,** it is almost
+> certainly not your password — see
+> [the board won't transmit](#the-board-wont-transmit-invisible-ap-or-reason-2-joining-wi-fi).
+> This is the single most likely thing to bite you on a SuperMini.
+
 ---
 
 ## Using it
@@ -90,25 +150,25 @@ showing its last content the whole time.
 **Web UI** — open the label's address:
 
 - text field for the content
-- TEXT / QR / TEXT+ / IMAGE toggle
-- font size small / medium / large (TEXT only)
-- **Preview** — renders on the device and shows the result in the page *without
-  touching the panel*, so you can check the wrap, the truncation or the QR size
-  before spending a 2.4 s refresh. The button then becomes **Print to panel**;
-  editing any field marks the preview out of date and it reverts to **Preview**.
+- **TEXT / QR / TEXT+ / IMAGE** tabs, each with exactly one input
+- font size small / medium / large
+- **Preview** — renders and shows the result in the page *without touching the
+  panel*, so you can check the wrap, the truncation or the QR size before
+  spending a 2.4 s refresh. The button then becomes **Print to panel**; editing
+  any field marks the preview out of date and it reverts to **Preview**.
 - **Print now** — skips the preview and draws immediately
 - **Clear panel**
 - the preview box is outlined while it shows an unprinted preview
 
-Preview runs the real renderer on the device into a separate scratch buffer, so
-what you see is the exact bitmap a print would produce — and payloads that are
-too long are rejected at preview time rather than after a wasted refresh.
+Preview runs the real renderer into a separate scratch buffer, so what you see
+is the exact bitmap a print would produce — and payloads that are too long are
+rejected at preview time rather than after a wasted refresh.
 
 Submitting content identical to what is already displayed is a no-op: the panel
 is left alone and the UI says so, rather than flashing for 2.4 s to draw the
 same thing.
 
-**Serial** — one command per line, at 115200 baud:
+**Serial** — one command per line, at 115200 baud (CR, LF or CRLF):
 
 ```
 TEXT:Hello from the desk
@@ -136,7 +196,7 @@ Oversized payloads are refused with a message rather than drawn as garbage:
 | QR   | whatever fits QR version 10 at ECC-M (~270 bytes). Longer payloads are rejected — bigger versions would be too dense to scan at 122 px |
 | TEXT+ / IMAGE | exactly 3904 bytes once decoded (250 × 122, 1 bit per pixel). Anything else is rejected |
 
-### Emoji, Hangul and pictures — IMAGE mode
+### Emoji, Hangul and pictures
 
 The device has no glyph data beyond a 5 × 7 ASCII table, so **TEXT mode folds
 anything outside ASCII 32–126 to `?`** — emoji, Hangul, accented Latin. QR mode
@@ -151,10 +211,10 @@ every font and emoji on the phone:
 
 Each tab has exactly one input, so there is nothing to reset when switching. The
 result goes onto a 250 × 122 canvas, is converted to 1 bit with Floyd–Steinberg
-dithering, and posted as a base64 3904-byte frame to `POST /api/image`. The
-device decodes, blits and stores it in NVS, so it survives a reboot. Nothing is
-re-rendered on the device, and preview for these tabs is instant because the
-bitmap already exists in the browser.
+dithering, and posted as a base64 3904-byte frame. The device decodes, blits and
+stores it in NVS, so it survives a reboot. Nothing is re-rendered on the device,
+and preview for these tabs is instant because the bitmap already exists in the
+browser.
 
 Both tabs store the same device-side mode. The source string tells them apart on
 reload — IMAGE never sends one.
@@ -164,7 +224,7 @@ high-luminance and would simply disappear under a threshold, but becomes a
 recognisable dot pattern when the error is diffused. Plain black text has no
 error to diffuse, so it stays crisp.
 
-Two things to expect:
+Three things to expect:
 
 - **The panel is 1 bit, so emoji arrive as silhouettes.** High-contrast
   pictograms (✓ ★ ♥ ⚠ ↑) read well. Detailed or pale ones often do not.
@@ -180,6 +240,34 @@ fixed 6 × 8 cell and would need reworking for a proportional font.
 
 ---
 
+## HTTP API
+
+Everything the web UI does is a plain form POST, so `curl` works just as well.
+
+| Method | Path | Body | Returns |
+|--------|------|------|---------|
+| `GET`  | `/` | | the web UI (redirects to `/wifi` until provisioned) |
+| `GET`  | `/wifi` | | the setup page |
+| `GET`  | `/api/status` | | mode, text, size, panel size, update count, SSID/IP/RSSI, and the committed frame as base64 |
+| `GET`  | `/api/scan` | | up to 20 nearby networks |
+| `POST` | `/api/preview` | `mode=text\|qr`, `text`, `size=1..3` | the rendered frame — **panel untouched** |
+| `POST` | `/api/display` | `mode=text\|qr`, `text`, `size=1..3` | `{"ok":true,"changed":bool}` |
+| `POST` | `/api/image` | `bits` (base64, 3904 bytes), `text` (optional source string) | as above |
+| `POST` | `/api/clear` | | as above |
+| `POST` | `/api/wifi` | `ssid`, `pass` | saves and reboots |
+
+```bash
+curl -s -X POST http://eink.local/api/display --data-urlencode 'mode=text' \
+     --data-urlencode 'text=back at 15:30' --data 'size=2'
+# {"ok":true,"changed":true}
+```
+
+Errors come back as HTTP 400 with `{"ok":false,"error":"..."}`. `changed:false`
+means the frame was identical to what the glass already holds and no refresh was
+performed.
+
+---
+
 ## Project layout
 
 ```
@@ -188,22 +276,49 @@ src/main.cpp        pin map, panel class, rendering, Wi-Fi, HTTP, serial
 src/web_ui.h        both HTML pages as PROGMEM strings
 ```
 
-Tunables at the top of `main.cpp`: `FULL_REFRESH_EVERY`, `MAX_TEXT_LEN`,
-`QR_MAX_VERSION`, `QR_ECC`, `QR_QUIET`, `AP_SSID`, `HOSTNAME`.
+Tunables at the top of `main.cpp`:
+
+| Constant | Default | Meaning |
+|----------|---------|---------|
+| `EPD_PANEL_CLASS` | `GxEPD2_213_BN` | [panel revision](#1-wrong-gxepd2-panel-class) |
+| `WIFI_TX_DBM` | `11` | [transmit power](#the-board-wont-transmit-invisible-ap-or-reason-2-joining-wi-fi) |
+| `PANEL_KEEP_POWERED_MS` | `0` | [full vs partial refresh](#ghosting-grey-text-or-update-display-doing-nothing) |
+| `FULL_REFRESH_EVERY` | `10` | partial updates between forced full ones |
+| `MAX_TEXT_LEN` | `400` | TEXT payload cap |
+| `QR_MAX_VERSION` / `QR_ECC` / `QR_QUIET` | `10` / M / `4` | QR sizing |
+| `AP_SSID` / `AP_CHANNEL` / `HOSTNAME` | `eink-setup` / `11` / `eink` | networking |
 
 ---
 
-## Troubleshooting: the display stays blank
+## Field notes
+
+Three findings cost most of the build time. If you are writing your own
+firmware for this hardware, these are the ones to know:
+
+1. **The SuperMini does not radiate cleanly at the default 20 dBm.** Receive is
+   fine, so scans work and it looks like a wrong password. Drop to 11 dBm.
+   → [details](#the-board-wont-transmit-invisible-ap-or-reason-2-joining-wi-fi)
+2. **Partial refresh and powering the panel down after each draw are mutually
+   exclusive on the SSD1680.** GxEPD2's `_PowerOn()` reloads the OTP waveform
+   over the partial LUT that `_Init_Part()` just wrote. Result: grey ink,
+   ghosting, and updates that do nothing. → [details](#ghosting-grey-text-or-update-display-doing-nothing)
+3. **`ricmoo/QRCode` never reports payload overflow.** "Try version 1, then 2,
+   until it stops failing" silently produces unscannable codes forever.
+   → [details](#qr-codes-that-will-not-scan)
+
+---
+
+## Troubleshooting
 
 An e-paper panel never reports errors — a wrong setting just leaves you with a
 white rectangle. Work down this list; the first two cover most cases.
 
 ### "Update display" finished instantly and nothing flashed
 
-That is correct behaviour, not the old fault. E-paper holds its image with no
-power, so redrawing pixels that are already on the glass buys nothing and just
-costs a 2.4 s flash. The firmware hashes the rendered framebuffer and skips the
-refresh when it matches what was last drawn; the API returns
+That is correct behaviour, not a fault. E-paper holds its image with no power,
+so redrawing pixels that are already on the glass buys nothing and just costs a
+2.4 s flash. The firmware hashes the rendered framebuffer and skips the refresh
+when it matches what was last drawn; the API returns
 `{"ok":true,"changed":false}` and the web UI says *"no change — the panel already
 shows this"*.
 
@@ -271,7 +386,9 @@ Codes are also refused below `QR_MIN_SCALE` (2 px per module). At this panel's
 ~0.19 mm pitch a one-pixel module cannot be read by a phone, so an over-long
 payload returns an error rather than drawing something useless.
 
-### 1. Wrong GxEPD2 panel class
+### The display stays blank
+
+#### 1. Wrong GxEPD2 panel class
 
 The most common cause. Every 2.13" revision uses a different controller init
 sequence, and the wrong one silently does nothing. Change the single macro near
@@ -295,7 +412,11 @@ unmarked, try `GxEPD2_213_BN` then `GxEPD2_213_B74` — those two cover nearly
 all panels sold today. Nothing else in the code has to change; panel dimensions
 are derived from the class.
 
-### 2. BUSY stuck high
+> Note when adapting this: use `WIDTH_VISIBLE` (122 on this panel), not `WIDTH`
+> (128, the controller's RAM width), or your canvas is six rows too tall and
+> vertical centring drifts.
+
+#### 2. BUSY stuck high
 
 If BUSY never goes low, GxEPD2 waits on it and gives up after its timeout, so
 the refresh silently never happens. Watch the serial monitor: GxEPD2 prints
@@ -310,7 +431,7 @@ the refresh silently never happens. Watch the serial monitor: GxEPD2 prints
 - Some clone panels invert BUSY. If BUSY reads high at idle *and* the wiring is
   right, the panel needs a different class (see 1).
 
-### 3. Swapped DC and CS
+#### 3. Swapped DC and CS
 
 DC on GPIO5, CS on GPIO10 — green and orange. Swapping them is easy on a
 crimped Waveshare cable and produces no error at all: every command byte gets
@@ -324,7 +445,7 @@ order is not the same as the header order on every HAT revision.
 Also check DIN/CLK are not swapped (blue = GPIO7, yellow = GPIO6); that failure
 looks identical.
 
-### 4. Driver HAT jumpers in the wrong position
+#### 4. Driver HAT jumpers in the wrong position
 
 On the Waveshare e-Paper Driver HAT:
 
@@ -337,7 +458,7 @@ On the Waveshare e-Paper Driver HAT:
 
 Both are silent failures with no serial output difference.
 
-### 5. Power
+#### 5. Power
 
 Panel VCC must come from the board's **3V3** pin, not 5V. Tapping 5V can leave
 the panel in an undefined state (or damage it) and shows as a blank or
@@ -357,7 +478,8 @@ SuperMini.** The symptoms look like three unrelated faults:
 
 They are one fault: **the board does not radiate cleanly at full transmit
 power.** Measured on this hardware from 30 cm, with the SoftAP moved across the
-band and power stepped down:
+band and power stepped down (numbers are `nmcli` signal strength; *invisible*
+means the beacon was not seen at all):
 
 | Channel | 20 dBm | 15 dBm | 11 dBm | 8 dBm | 5 dBm |
 |---------|--------|--------|--------|-------|-------|
@@ -413,6 +535,17 @@ WIFI:<ssid>,<password>
 Split on the first comma only, so passwords may contain commas (SSIDs may not).
 The device saves to NVS and reboots.
 
+### Nothing at all on serial
+
+If `pio device monitor` shows no boot banner, the firmware is not running:
+check `-D ARDUINO_USB_CDC_ON_BOOT=1` is present in `platformio.ini`, and that
+no wire is pulling **GPIO9** low at power-up — that puts the C3 into download
+mode, where it sits forever.
+
+If the banner appears as garbage, the monitor is at the wrong baud — run
+`pio device monitor` **from the project directory** so it reads `monitor_speed`
+from `platformio.ini`.
+
 ### Log lines that are *not* problems
 
 ```
@@ -433,11 +566,14 @@ GxEPD2 timing diagnostics, in **microseconds** (not milliseconds). Healthy
 values on this panel: power-on ~96 ms, partial refresh ~450 ms, full refresh
 ~2130 ms. **Values near zero mean the BUSY line never went busy** — normal with
 no panel attached, since GPIO4 floats low, but with the panel wired it means
-BUSY is not reaching GPIO4. See section 2.
+BUSY is not reaching GPIO4. See [BUSY stuck high](#2-busy-stuck-high).
 
-### 6. Nothing at all on serial
+---
 
-If `pio device monitor` shows no boot banner, the firmware is not running:
-check `-D ARDUINO_USB_CDC_ON_BOOT=1` is present in `platformio.ini`, and that
-no wire is pulling **GPIO9** low at power-up — that puts the C3 into download
-mode, where it sits forever.
+## Built with
+
+[GxEPD2](https://github.com/ZinggJM/GxEPD2) ·
+[Adafruit GFX](https://github.com/adafruit/Adafruit-GFX-Library) ·
+[ricmoo/QRCode](https://github.com/ricmoo/QRCode) ·
+[PlatformIO](https://platformio.org/) ·
+[arduino-esp32](https://github.com/espressif/arduino-esp32)
