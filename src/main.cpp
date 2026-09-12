@@ -71,13 +71,25 @@ static const uint16_t PANEL_H = EPD_PANEL_CLASS::WIDTH_VISIBLE;
 
 // ── Tunables ────────────────────────────────────────────────────────────────
 static const uint8_t  FULL_REFRESH_EVERY = 10;   // partial updates between full ones
-// The panel is powered off (charge pump disabled) immediately after every draw,
-// which is what protects the film from being left under drive voltage. Deep
-// sleep is a separate, weaker concern: it saves microamps we do not care about
-// on USB power, and it COSTS us partial refresh, because waking from it resets
-// the controller and wipes the previous-image RAM. So hibernate only once the
-// label has genuinely gone idle; the draw that wakes it is forced to full.
-static const uint32_t PANEL_HIBERNATE_AFTER_MS = 300000;   // 5 minutes
+// How long to leave the panel powered after a draw, in ms.
+//
+// GxEPD2's partial refresh only works while the panel is STILL POWERED from the
+// previous draw. _Update_Part() writes the partial waveform (0x32) and then
+// calls _PowerOn(), which issues 0x22/0xf8 — and bit 0x10 of that reloads the
+// OTP waveform straight over the partial one. Normally _PowerOn() is a no-op
+// because power was never dropped; if we powered off, it runs, and the partial
+// refresh executes with the wrong LUT: grey under-driven ink, the old image not
+// cleared, sometimes no visible change at all.
+//
+// 0 (the default) means power the panel down the instant a draw finishes, so it
+// is never left under drive voltage. The unavoidable consequence is that every
+// update is a full refresh: ~2.4 s and it flashes, but it is always clean.
+//
+// Set this to e.g. 30000 to keep the charge pump on for 30 s after a draw, so
+// edits made in quick succession get fast (~630 ms) partial refreshes. That
+// trades the panel sitting powered during the window for the speed.
+static const uint32_t PANEL_KEEP_POWERED_MS    = 0;
+static const uint32_t PANEL_HIBERNATE_AFTER_MS = 300000;   // 5 min, deep sleep
 static const uint16_t MAX_TEXT_LEN       = 400;  // chars accepted in TEXT mode
 static const uint8_t  QR_MAX_VERSION     = 10;   // 57x57 modules; bigger is unreadable here
 static const uint8_t  QR_ECC             = ECC_MEDIUM;
@@ -120,7 +132,8 @@ static uint32_t g_updates = 0;
 
 static bool     g_drawnSinceBoot   = false;
 static uint8_t  g_partialsSinceFull = 0;
-static bool     g_panelAsleep       = true;   // true = controller RAM is not valid
+static bool     g_panelPowered     = false;  // charge pump on: partial refresh is safe
+static bool     g_panelAsleep       = true;   // controller deep-sleeping
 static uint32_t g_lastDrawMs        = 0;
 
 // ── Network state ───────────────────────────────────────────────────────────
@@ -374,16 +387,12 @@ static void displayBegin() {
 
 // Copies the canvas to the panel.
 //
-// A fast partial refresh on the SSD1680 drives the transition between the
-// controller's previous-image RAM (0x26) and current RAM (0x24). GxEPD2 keeps
-// 0x26 in step for us via writeImageAgain() after each refresh — but ONLY while
-// the controller is never reset. Waking from hibernate resets it and leaves
-// 0x26 undefined, so the next partial update transitions from garbage and the
-// old image stays on the glass. Hence: full refresh whenever the RAM cannot be
-// trusted (first draw after boot, or after hibernate), on an explicit clear, and
-// every FULL_REFRESH_EVERY partials to sweep up accumulated ghosting.
+// Partial refresh is only attempted when the panel is still powered from the
+// previous draw (see PANEL_KEEP_POWERED_MS). Otherwise, and on the first draw
+// after boot, on an explicit clear, and every FULL_REFRESH_EVERY partials to
+// sweep up accumulated ghosting, we do a full refresh.
 static void pushCanvas(bool forceFull = false) {
-  const bool full = forceFull || !g_drawnSinceBoot || g_panelAsleep ||
+  const bool full = forceFull || !g_drawnSinceBoot || !g_panelPowered ||
                     (g_partialsSinceFull >= FULL_REFRESH_EVERY);
 
   if (full) display.setFullWindow();
@@ -397,10 +406,13 @@ static void pushCanvas(bool forceFull = false) {
   } while (display.nextPage());
   const uint32_t ms = millis() - t0;
 
-  // Charge pump off, controller left awake so its previous-image RAM survives
-  // and the next update can be a partial one.
-  display.powerOff();
   g_panelAsleep = false;
+  if (PANEL_KEEP_POWERED_MS == 0) {
+    display.powerOff();          // never left under drive voltage
+    g_panelPowered = false;
+  } else {
+    g_panelPowered = true;       // kept alive so the next update can be partial
+  }
   g_lastDrawMs = millis();
 
   if (full) g_partialsSinceFull = 0;
@@ -412,14 +424,21 @@ static void pushCanvas(bool forceFull = false) {
                 full ? "full" : "partial", (unsigned long)ms, g_partialsSinceFull);
 }
 
-// Deep-sleep the controller once the label has been idle a while. This throws
-// away the previous-image RAM, so pushCanvas() forces a full refresh next time.
+// Drops the panel out of its powered window, then eventually into deep sleep.
 static void panelTick() {
-  if (g_panelAsleep || !g_drawnSinceBoot) return;
-  if (millis() - g_lastDrawMs < PANEL_HIBERNATE_AFTER_MS) return;
-  display.hibernate();
-  g_panelAsleep = true;
-  Serial.println(F("[epd] idle — panel hibernated; next draw will be full"));
+  if (!g_drawnSinceBoot) return;
+  const uint32_t idle = millis() - g_lastDrawMs;
+
+  if (g_panelPowered && idle >= PANEL_KEEP_POWERED_MS) {
+    display.powerOff();
+    g_panelPowered = false;
+    Serial.println(F("[epd] powered window over — panel off"));
+  }
+  if (!g_panelAsleep && !g_panelPowered && idle >= PANEL_HIBERNATE_AFTER_MS) {
+    display.hibernate();
+    g_panelAsleep = true;
+    Serial.println(F("[epd] idle — panel hibernated"));
+  }
 }
 
 // ============================================================================

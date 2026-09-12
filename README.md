@@ -149,31 +149,49 @@ Tunables at the top of `main.cpp`: `FULL_REFRESH_EVERY`, `MAX_TEXT_LEN`,
 An e-paper panel never reports errors — a wrong setting just leaves you with a
 white rectangle. Work down this list; the first two cover most cases.
 
-### Old content stays on screen under the new content
+### Ghosting, grey text, or "Update display" doing nothing
 
-Ghosting where the previous image remains visible, overlapping the new one, is
-not a panel defect — it is `hibernate()` and partial refresh being mutually
-exclusive.
+All three are the same fault: **a partial refresh running with the wrong
+waveform**, and on this hardware they are unavoidable if the panel is powered
+down after each draw. The giveaway is that *Clear panel* always works — that is
+the forced full-refresh path.
 
-The SSD1680 holds two buffers: `0x24` (current) and `0x26` (previous). A fast
-partial refresh drives the *transition* between them, and GxEPD2 keeps `0x26` in
-step by calling `writeImageAgain()` after each refresh. That bookkeeping only
-survives while the controller is never reset. `hibernate()` issues deep-sleep
-command `0x10`, so waking requires a hardware reset, which wipes `0x26` — the
-next partial update then transitions from undefined data and leaves the old ink
-behind. The first draw after boot looks fine because GxEPD2 forces the initial
-refresh to be full.
+GxEPD2's partial update assumes the panel is still powered from the previous
+draw:
 
-This firmware therefore calls **`powerOff()`** after every draw, not
-`hibernate()`. `powerOff()` disables the charge pump, which is what actually
-protects the film from being left under drive voltage; it leaves the controller
-awake so its RAM stays valid and partial updates keep working. Deep sleep only
-saves microamps, which is irrelevant on USB power, so it is deferred to
-`PANEL_HIBERNATE_AFTER_MS` (5 minutes) of idle — and the draw that wakes the
-panel is forced to a full refresh, since the RAM is gone by then.
+```cpp
+void GxEPD2_213_BN::_Update_Part() {
+  if (!_using_partial_mode) _Init_Part();   // writes the partial LUT via 0x32
+  _PowerOn();                               // 0x22 0xf8 — bit 0x10 loads the OTP LUT
+  _writeCommand(0x22); _writeData(0xcc);    // display
+}
+```
 
-A full refresh is also forced on the first draw after boot, on `CLEAR`, and
-every `FULL_REFRESH_EVERY` partial updates.
+`_PowerOff()` clears both `_power_is_on` and `_using_partial_mode`. So after a
+power-off, `_Init_Part()` writes the partial waveform and then `_PowerOn()`
+*actually runs* and reloads the OTP waveform right over it. The update then
+executes with a full-refresh LUT under a partial-refresh drive command: ink
+comes out grey and under-driven, the previous image is not cleared, and
+sometimes nothing visibly changes. Normally `_PowerOn()` is a no-op there, which
+is why stock GxEPD2 examples work — they never drop power between updates.
+
+`hibernate()` is worse still: it deep-sleeps the controller, so waking it
+hardware-resets the chip and wipes the previous-image RAM (`0x26`) that a
+partial refresh transitions *from*.
+
+So on this controller, **partial refresh and powering the panel down after every
+draw are mutually exclusive.** Pick one with `PANEL_KEEP_POWERED_MS`:
+
+| Value | Behaviour |
+|-------|-----------|
+| `0` (default) | Panel powered off the instant a draw finishes, never left under drive voltage. Every update is a full refresh: ~2.4 s, flashes, always clean. |
+| e.g. `30000` | Charge pump stays on for 30 s after a draw, so edits in quick succession get ~630 ms partial refreshes. The panel sits powered for that window. |
+
+With a non-zero window, a draw arriving after the window has closed is
+automatically promoted to a full refresh, because partial would be unsafe.
+
+A full refresh is also forced on the first draw after boot, on `CLEAR`, and every
+`FULL_REFRESH_EVERY` partial updates.
 
 ### QR codes that will not scan
 
