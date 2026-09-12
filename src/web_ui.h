@@ -20,7 +20,8 @@ main{max-width:520px;margin:0 auto;padding:18px 16px 40px}
 h1{font-size:19px;margin:4px 0 16px;letter-spacing:.02em}
 h1 span{color:var(--mut);font-weight:400}
 .card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:14px;margin-bottom:14px}
-#pvwrap{background:#fff;border-radius:8px;padding:6px;line-height:0}
+#pvwrap{background:#fff;border-radius:8px;padding:6px;line-height:0;box-shadow:0 0 0 0 transparent;transition:box-shadow .15s}
+#pvwrap.pending{box-shadow:0 0 0 2px var(--acc)}
 #pv{width:100%;height:auto;image-rendering:pixelated;image-rendering:crisp-edges}
 .muted{color:var(--mut);font-size:13px;margin:8px 2px 0}
 .seg{display:flex;gap:6px;background:#141720;border:1px solid var(--line);border-radius:10px;padding:4px;margin-bottom:12px}
@@ -68,7 +69,8 @@ a{color:var(--acc)}
     </label>
     <span class="muted" id="cnt">0</span>
   </div>
-  <button id="go" type="submit">Update display</button>
+  <button id="btnpv" type="button">Preview</button>
+  <button id="go" type="submit" class="ghost">Print now</button>
   <button id="clr" type="button" class="ghost">Clear panel</button>
 </form>
 
@@ -78,6 +80,9 @@ a{color:var(--acc)}
 <script>
 var $=function(s){return document.querySelector(s)};
 function say(t,cls){var m=$("#msg");m.textContent=t;m.className=cls||""}
+
+var panel=null;        // last image known to be on the glass
+var previewed=false;   // canvas is showing an unprinted preview
 
 function paint(b64,w,h){
   var c=$("#pv");c.width=w;c.height=h;
@@ -101,50 +106,86 @@ function syncMode(){
 }
 function syncCount(){$("#cnt").textContent=$("#txt").value.length+" chars"}
 
+function params(){
+  var b=new URLSearchParams();
+  b.set("mode",modeText()?"text":"qr");
+  b.set("text",$("#txt").value);
+  b.set("size",$("#sz").value);
+  return b;
+}
+
+function clearPreview(){
+  previewed=false;
+  $("#btnpv").textContent="Preview";
+  $("#pvwrap").className="";
+}
+
+// An edit invalidates the preview on screen, but throwing the image away would
+// be more jarring than leaving it with an honest label.
+function stale(){
+  if(!previewed) return;
+  previewed=false;
+  $("#btnpv").textContent="Preview";
+  $("#now").textContent="preview is out of date — press Preview";
+}
+
 function load(){
   fetch("/api/status").then(function(r){return r.json()}).then(function(j){
-    paint(j.preview,j.w,j.h);
-    $("#dim").textContent=j.w+"×"+j.h;
-    $("#now").textContent=j.mode==="none"
+    var cap = j.mode==="none"
       ? "panel is blank"
-      : j.mode.toUpperCase()+" · "+j.updates+" update"+(j.updates==1?"":"s")+" since boot";
+      : j.mode.toUpperCase()+" \u00b7 "+j.updates+" update"+(j.updates==1?"":"s")+" since boot";
+    panel={b64:j.preview,w:j.w,h:j.h,caption:cap};
+    $("#dim").textContent=j.w+"\u00d7"+j.h;
+    if(!previewed){ paint(j.preview,j.w,j.h); $("#now").textContent=cap; }
     if(j.mode!=="none"){
       $(j.mode==="qr"?"#m2":"#m1").checked=true;
       $("#txt").value=j.text;
       $("#sz").value=j.size;
     }
-    $("#net").textContent=j.ap?("AP "+j.ssid+" · "+j.ip)
-                              :(j.ssid+" · "+j.ip+" · "+j.rssi+" dBm");
+    $("#net").textContent=j.ap?("AP "+j.ssid+" \u00b7 "+j.ip)
+                              :(j.ssid+" \u00b7 "+j.ip+" \u00b7 "+j.rssi+" dBm");
     syncMode();syncCount();
   }).catch(function(){say("cannot reach the label","err")});
 }
 
-function post(url,body){
-  var go=$("#go");go.disabled=true;say("working…");
+function busy(b){$("#go").disabled=b;$("#btnpv").disabled=b;$("#clr").disabled=b}
+
+function post(url,body,okmsg){
+  busy(true);say("working\u2026");
   return fetch(url,{method:"POST",body:body}).then(function(r){return r.json()})
     .then(function(j){
-      go.disabled=false;
-      if(j.ok){
-        say(j.changed===false
-              ? "no change — the panel already shows this"
-              : "display updated","ok");
-        load();
-      }else{say(j.error,"err")}
-    }).catch(function(){go.disabled=false;say("request failed","err")});
+      busy(false);
+      if(!j.ok){say(j.error,"err");return}
+      say(j.changed===false
+            ? "no change \u2014 the panel already shows this"
+            : (okmsg||"display updated"),"ok");
+      clearPreview();
+      load();
+    }).catch(function(){busy(false);say("request failed","err")});
 }
 
-$("#f").addEventListener("submit",function(e){
-  e.preventDefault();
-  var b=new URLSearchParams();
-  b.set("mode",modeText()?"text":"qr");
-  b.set("text",$("#txt").value);
-  b.set("size",$("#sz").value);
-  post("/api/display",b);
+$("#btnpv").addEventListener("click",function(){
+  if(previewed){ post("/api/display",params(),"printed to the panel"); return; }
+  busy(true);say("rendering\u2026");
+  fetch("/api/preview",{method:"POST",body:params()}).then(function(r){return r.json()})
+    .then(function(j){
+      busy(false);
+      if(!j.ok){say(j.error,"err");return}
+      paint(j.preview,j.w,j.h);
+      previewed=true;
+      $("#btnpv").textContent="Print to panel";
+      $("#pvwrap").className="pending";
+      $("#now").textContent="preview \u2014 the panel has not been touched";
+      say("this is how it will look","ok");
+    }).catch(function(){busy(false);say("request failed","err")});
 });
-$("#clr").addEventListener("click",function(){post("/api/clear",new URLSearchParams())});
-$("#m1").addEventListener("change",syncMode);
-$("#m2").addEventListener("change",syncMode);
-$("#txt").addEventListener("input",syncCount);
+
+$("#f").addEventListener("submit",function(e){e.preventDefault();post("/api/display",params())});
+$("#clr").addEventListener("click",function(){post("/api/clear",new URLSearchParams(),"panel cleared")});
+$("#m1").addEventListener("change",function(){syncMode();stale()});
+$("#m2").addEventListener("change",function(){syncMode();stale()});
+$("#sz").addEventListener("change",stale);
+$("#txt").addEventListener("input",function(){syncCount();stale()});
 load();
 </script>
 </main></body></html>)HTML";

@@ -119,6 +119,10 @@ static const int8_t   WIFI_TX_DBM        = 11;
 // the very same bits as its preview — so the preview is pixel-exact, not a
 // browser-side approximation.
 static GFXcanvas1 canvas(PANEL_W, PANEL_H);
+// Dry-run target for /api/preview. Rendering a preview must not disturb `canvas`,
+// which is the record of what is actually on the glass and what /api/status
+// reports, or the page would show an unprinted preview as if it were the panel.
+static GFXcanvas1 scratch(PANEL_W, PANEL_H);
 static const uint16_t CANVAS_STRIDE = (PANEL_W + 7) / 8;
 static const uint32_t CANVAS_BYTES  = (uint32_t)CANVAS_STRIDE * PANEL_H;
 
@@ -264,7 +268,7 @@ static uint8_t wrapText(const String& s, uint16_t cols, uint8_t maxRows,
   return n;
 }
 
-static void renderTextToCanvas(const String& raw, uint8_t size) {
+static void renderTextToCanvas(GFXcanvas1& c, const String& raw, uint8_t size) {
   String s = sanitizeForFont(raw);
 
   const uint16_t cw    = 6 * size;               // built-in font cell
@@ -285,19 +289,19 @@ static void renderTextToCanvas(const String& raw, uint8_t size) {
     last += "...";
   }
 
-  canvas.fillScreen(0);
-  canvas.setFont(NULL);
-  canvas.setTextSize(size);
-  canvas.setTextColor(1);
-  canvas.setTextWrap(false);
+  c.fillScreen(0);
+  c.setFont(NULL);
+  c.setTextSize(size);
+  c.setTextColor(1);
+  c.setTextWrap(false);
 
   int16_t y0 = ((int16_t)PANEL_H - (int16_t)(n * pitch)) / 2;
   if (y0 < 0) y0 = 0;
   for (uint8_t i = 0; i < n; i++) {
     int16_t x = ((int16_t)PANEL_W - (int16_t)(lines[i].length() * cw)) / 2;
     if (x < 0) x = 0;
-    canvas.setCursor(x, y0 + i * pitch);
-    canvas.print(lines[i]);
+    c.setCursor(x, y0 + i * pitch);
+    c.print(lines[i]);
   }
 }
 
@@ -322,7 +326,7 @@ static const uint16_t QR_BYTE_CAPACITY[4][QR_MAX_VERSION] = {
   {  7, 14, 24, 34,  44,  58,  64,  84,  98, 119 },  // ECC_HIGH
 };
 
-static bool renderQrToCanvas(const String& payload, String& err) {
+static bool renderQrToCanvas(GFXcanvas1& c, const String& payload, String& err) {
   static uint8_t qrBuf[QR_BUF_BYTES];
   QRCode qr;
   uint8_t version = 0;
@@ -357,11 +361,11 @@ static bool renderQrToCanvas(const String& payload, String& err) {
   const int16_t ox   = ((int16_t)PANEL_W - side) / 2;
   const int16_t oy   = ((int16_t)PANEL_H - side) / 2;
 
-  canvas.fillScreen(0);                       // white; quiet zone is just margin
+  c.fillScreen(0);                            // white; quiet zone is just margin
   for (uint16_t y = 0; y < modules; y++) {
     for (uint16_t x = 0; x < modules; x++) {
       if (qrcode_getModule(&qr, x, y)) {
-        canvas.fillRect(ox + x * scale, oy + y * scale, scale, scale, 1);
+        c.fillRect(ox + x * scale, oy + y * scale, scale, scale, 1);
       }
     }
   }
@@ -488,8 +492,8 @@ static void loadContent() {
 }
 
 // Renders into the canvas only; err is filled on rejection.
-static bool renderToCanvas(Mode mode, const String& text, uint8_t size, String& err) {
-  if (mode == MODE_NONE) { canvas.fillScreen(0); return true; }
+static bool renderToCanvas(GFXcanvas1& c, Mode mode, const String& text, uint8_t size, String& err) {
+  if (mode == MODE_NONE) { c.fillScreen(0); return true; }
 
   if (text.length() == 0) { err = "nothing to display"; return false; }
 
@@ -499,14 +503,14 @@ static bool renderToCanvas(Mode mode, const String& text, uint8_t size, String& 
       return false;
     }
     if (size < 1 || size > 3) { err = "font size must be 1, 2 or 3"; return false; }
-    renderTextToCanvas(text, size);
+    renderTextToCanvas(c, text, size);
     return true;
   }
-  return renderQrToCanvas(text, err);
+  return renderQrToCanvas(c, text, err);
 }
 
 static bool applyContent(Mode mode, const String& text, uint8_t size, String& err) {
-  if (!renderToCanvas(mode, text, size, err)) return false;
+  if (!renderToCanvas(canvas, mode, text, size, err)) return false;
   g_mode = mode;
   g_text = (mode == MODE_NONE) ? "" : text;
   if (mode == MODE_TEXT) g_size = size;
@@ -522,7 +526,7 @@ static void drawBootHint() {
   String s = g_apActive
       ? String("Wi-Fi setup\njoin \"") + AP_SSID + "\"\nthen open\n192.168.4.1"
       : String("e-ink label\nhttp://") + WiFi.localIP().toString();
-  renderTextToCanvas(s, 2);
+  renderTextToCanvas(canvas, s, 2);
   pushCanvas();
 }
 
@@ -760,6 +764,31 @@ static void handleStatus() {
   sendJson(200, j);
 }
 
+// Renders into the scratch canvas and returns the bits without touching the
+// panel, so the page can show exactly what a print would produce.
+static void handlePreview() {
+  String mode = server.arg("mode");
+  String text = server.arg("text");
+  uint8_t size = (uint8_t)server.arg("size").toInt();
+  if (size < 1 || size > 3) size = g_size;
+
+  Mode m;
+  if (mode == "text")    m = MODE_TEXT;
+  else if (mode == "qr") m = MODE_QR;
+  else { sendErr("mode must be \"text\" or \"qr\""); return; }
+
+  String err;
+  if (!renderToCanvas(scratch, m, text, size, err)) { sendErr(err); return; }
+
+  String j;
+  j.reserve(CANVAS_BYTES * 2);
+  j  = "{\"ok\":true,\"w\":"; j += PANEL_W;
+  j += ",\"h\":";              j += PANEL_H;
+  j += ",\"preview\":\"";     j += base64(scratch.getBuffer(), CANVAS_BYTES);
+  j += "\"}";
+  sendJson(200, j);
+}
+
 static void handleDisplay() {
   String mode = server.arg("mode");
   String text = server.arg("text");
@@ -828,6 +857,7 @@ static void serverBegin() {
   server.on("/wifi",        HTTP_GET,  handleWifiPage);
   server.on("/api/status",  HTTP_GET,  handleStatus);
   server.on("/api/scan",    HTTP_GET,  handleScan);
+  server.on("/api/preview", HTTP_POST, handlePreview);
   server.on("/api/display", HTTP_POST, handleDisplay);
   server.on("/api/clear",   HTTP_POST, handleClear);
   server.on("/api/wifi",    HTTP_POST, handleWifiSave);
@@ -1003,7 +1033,7 @@ void setup() {
   loadContent();
   if (g_mode != MODE_NONE) {
     String err;
-    if (renderToCanvas(g_mode, g_text, g_size, err)) pushCanvas();
+    if (renderToCanvas(canvas, g_mode, g_text, g_size, err)) pushCanvas();
     else Serial.printf("[epd] stored content rejected: %s\n", err.c_str());
   }
 

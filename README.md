@@ -92,8 +92,17 @@ showing its last content the whole time.
 - text field for the content
 - TEXT / QR toggle
 - font size small / medium / large (TEXT only)
-- **Update display**, **Clear panel**
-- preview of exactly what is on the panel right now
+- **Preview** — renders on the device and shows the result in the page *without
+  touching the panel*, so you can check the wrap, the truncation or the QR size
+  before spending a 2.4 s refresh. The button then becomes **Print to panel**;
+  editing any field marks the preview out of date and it reverts to **Preview**.
+- **Print now** — skips the preview and draws immediately
+- **Clear panel**
+- the preview box is outlined while it shows an unprinted preview
+
+Preview runs the real renderer on the device into a separate scratch buffer, so
+what you see is the exact bitmap a print would produce — and payloads that are
+too long are rejected at preview time rather than after a wasted refresh.
 
 Submitting content identical to what is already displayed is a no-op: the panel
 is left alone and the UI says so, rather than flashing for 2.4 s to draw the
