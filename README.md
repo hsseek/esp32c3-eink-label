@@ -90,7 +90,7 @@ showing its last content the whole time.
 **Web UI** — open the label's address:
 
 - text field for the content
-- TEXT / QR toggle
+- TEXT / QR / IMAGE toggle
 - font size small / medium / large (TEXT only)
 - **Preview** — renders on the device and shows the result in the page *without
   touching the panel*, so you can check the wrap, the truncation or the QR size
@@ -134,13 +134,37 @@ Oversized payloads are refused with a message rather than drawn as garbage:
 |------|-------|
 | TEXT | 400 characters (`MAX_TEXT_LEN`). Text that wraps past the panel height is truncated with `...` |
 | QR   | whatever fits QR version 10 at ECC-M (~270 bytes). Longer payloads are rejected — bigger versions would be too dense to scan at 122 px |
+| IMAGE | exactly 3904 bytes once decoded (250 × 122, 1 bit per pixel). Anything else is rejected |
 
-The built-in GFX font covers ASCII 32–126 only; other bytes (including Korean
-and emoji) are folded to `?` in TEXT mode. QR mode encodes the raw bytes, so
-non-ASCII payloads scan fine there. To render Hangul on the panel you would
-need a bitmap font with those glyphs — GxEPD2 can use any Adafruit GFX font via
-`canvas.setFont()`, but the wrap code in `renderTextToCanvas()` assumes a fixed
-6 × 8 cell and would need reworking for a proportional font.
+### Emoji, Hangul and pictures — IMAGE mode
+
+The device has no glyph data beyond a 5 × 7 ASCII table, so **TEXT mode folds
+anything outside ASCII 32–126 to `?`** — emoji, Hangul, accented Latin. QR mode
+is unaffected, since it encodes raw bytes.
+
+IMAGE mode sidesteps the problem entirely: the browser already has every font
+and emoji on the phone, so the page rasterises there. It renders your text (or a
+picture you choose) onto a 250 × 122 canvas, converts it to 1 bit with
+Floyd–Steinberg dithering, and posts the finished 3904-byte frame as base64 to
+`POST /api/image`. The device decodes it, blits it, and keeps it in NVS, so it
+comes back after a reboot. Nothing is re-rendered on the device.
+
+Dithering rather than a hard threshold matters here: a bright yellow emoji is
+high-luminance and would simply disappear under a threshold, but becomes a
+recognisable dot pattern when the error is diffused. Plain black text has no
+error to diffuse, so it stays crisp.
+
+Two things to expect:
+
+- **The panel is 1 bit, so emoji arrive as silhouettes.** High-contrast
+  pictograms (✓ ★ ♥ ⚠ ↑) read well. Detailed or pale ones often do not.
+- **IMAGE mode is browser-only.** The serial protocol has no way to send a
+  frame, so `TEXT:` and `QR:` remain ASCII-only. The stored source string is
+  kept purely so the page can repopulate its field.
+
+To render Hangul from the device itself instead, you would need an Adafruit GFX
+bitmap font containing those glyphs; note that `renderTextToCanvas()` wraps on a
+fixed 6 × 8 cell and would need reworking for a proportional font.
 
 ---
 

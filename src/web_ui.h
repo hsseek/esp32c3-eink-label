@@ -40,6 +40,9 @@ button{width:100%;margin-top:12px;padding:13px;border:0;border-radius:11px;backg
   color:#fff;font:600 16px inherit;cursor:pointer}
 button:disabled{opacity:.5}
 button.ghost{background:transparent;border:1px solid var(--line);color:var(--mut)}
+input[type=file]{width:100%;background:#141720;color:var(--mut);border:1px solid var(--line);
+  border-radius:10px;padding:10px;font:13px inherit;margin-top:5px}
+#imgrow{margin-top:12px}
 #msg{min-height:20px;font-size:14px;margin:2px 2px 14px}
 #msg.err{color:var(--err)} #msg.ok{color:var(--ok)}
 a{color:var(--acc)}
@@ -57,6 +60,7 @@ a{color:var(--acc)}
   <div class="seg">
     <input type="radio" name="mode" id="m1" value="text" checked><label for="m1">TEXT</label>
     <input type="radio" name="mode" id="m2" value="qr"><label for="m2">QR</label>
+    <input type="radio" name="mode" id="m3" value="image"><label for="m3">IMAGE</label>
   </div>
   <textarea id="txt" placeholder="What should the label say?" maxlength="400"></textarea>
   <div class="row">
@@ -68,6 +72,11 @@ a{color:var(--acc)}
       </select>
     </label>
     <span class="muted" id="cnt">0</span>
+  </div>
+  <div class="hide" id="imgrow">
+    <label class="fld" for="file">Picture &mdash; leave empty to render the text above</label>
+    <input type="file" id="file" accept="image/*">
+    <button type="button" class="ghost" id="nofile">Clear picture</button>
   </div>
   <button id="btnpv" type="button">Preview</button>
   <button id="go" type="submit" class="ghost">Print now</button>
@@ -99,23 +108,97 @@ function paint(b64,w,h){
   ctx.putImageData(img,0,0);
 }
 
-function modeText(){return $("#m1").checked}
+function curMode(){return $("#m1").checked?"text":($("#m2").checked?"qr":"image")}
 function syncMode(){
-  $("#szrow").className=modeText()?"fld":"fld hide";
-  $("#txt").placeholder=modeText()?"What should the label say?":"URL or text to encode";
+  var m=curMode();
+  $("#szrow").className=(m==="qr")?"fld hide":"fld";
+  $("#imgrow").className=(m==="image")?"":"hide";
+  $("#txt").placeholder = m==="qr" ? "URL or text to encode"
+    : m==="image" ? "Text, emoji, any script your phone can draw"
+    : "What should the label say?";
+}
+
+// ---- IMAGE mode: the phone rasterises, the panel just blits ----------------
+// The device has no glyphs beyond 5x7 ASCII, but this browser already has every
+// font and emoji on the system. So render here, threshold to 1 bit, and send
+// the finished frame. Same packing the panel uses: MSB first, 1 = black.
+var W=250,H=122,pic=null,pendingBits=null;
+
+function sizePx(){return {"1":13,"2":19,"3":27}[$("#sz").value]||19}
+
+function drawSource(ctx){
+  ctx.fillStyle="#fff";ctx.fillRect(0,0,W,H);
+  if(pic){
+    var s=Math.min(W/pic.width,H/pic.height);
+    var dw=Math.max(1,Math.round(pic.width*s)),dh=Math.max(1,Math.round(pic.height*s));
+    ctx.drawImage(pic,(W-dw)>>1,(H-dh)>>1,dw,dh);
+    return;
+  }
+  var px=sizePx(),lh=Math.round(px*1.25);
+  ctx.fillStyle="#000";ctx.textBaseline="top";
+  ctx.font=px+'px system-ui,-apple-system,"Segoe UI",Roboto,"Noto Color Emoji","Apple Color Emoji",sans-serif';
+  var lines=[];
+  $("#txt").value.split("\n").forEach(function(para){
+    var cur="";
+    para.split(" ").forEach(function(word){
+      var t2=cur?cur+" "+word:word;
+      if(!cur||ctx.measureText(t2).width<=W-6) cur=t2; else {lines.push(cur);cur=word}
+    });
+    lines.push(cur);
+  });
+  var max=Math.max(1,Math.floor(H/lh));
+  if(lines.length>max){lines=lines.slice(0,max);lines[max-1]+="\u2026"}
+  var y0=Math.max(0,Math.round((H-lines.length*lh)/2));
+  lines.forEach(function(l,i){
+    ctx.fillText(l,Math.max(0,(W-ctx.measureText(l).width)/2),y0+i*lh);
+  });
+}
+
+// Floyd-Steinberg. Plain black text has no error to diffuse so it stays crisp,
+// while a bright emoji or a photo becomes a dot pattern instead of vanishing
+// under a hard threshold.
+function packDithered(ctx){
+  var d=ctx.getImageData(0,0,W,H).data,g=new Float32Array(W*H);
+  for(var i=0,p=0;i<d.length;i+=4,p++){
+    var a=d[i+3]/255;
+    var r=d[i]*a+255*(1-a),gg=d[i+1]*a+255*(1-a),b=d[i+2]*a+255*(1-a);
+    g[p]=0.299*r+0.587*gg+0.114*b;
+  }
+  var stride=(W+7)>>3,out=new Uint8Array(stride*H);
+  for(var y=0;y<H;y++)for(var x=0;x<W;x++){
+    var k=y*W+x,old=g[k],nv=old<128?0:255,err=old-nv;
+    g[k]=nv;
+    if(x+1<W) g[k+1]+=err*7/16;
+    if(y+1<H){
+      if(x>0)   g[k+W-1]+=err*3/16;
+      g[k+W]+=err*5/16;
+      if(x+1<W) g[k+W+1]+=err*1/16;
+    }
+    if(nv===0) out[y*stride+(x>>3)]|=0x80>>(x&7);
+  }
+  return out;
+}
+
+function localBits(){
+  var c=document.createElement("canvas");c.width=W;c.height=H;
+  var ctx=c.getContext("2d",{willReadFrequently:true});
+  drawSource(ctx);
+  var u=packDithered(ctx),s="";
+  for(var i=0;i<u.length;i++) s+=String.fromCharCode(u[i]);
+  return btoa(s);
 }
 function syncCount(){$("#cnt").textContent=$("#txt").value.length+" chars"}
 
 function params(){
   var b=new URLSearchParams();
-  b.set("mode",modeText()?"text":"qr");
+  b.set("mode",curMode());
   b.set("text",$("#txt").value);
   b.set("size",$("#sz").value);
   return b;
 }
 
 function clearPreview(){
-  previewed=false;
+  previewed=false;pendingBits=null;
   $("#btnpv").textContent="Preview";
   $("#pvwrap").className="";
 }
@@ -124,9 +207,9 @@ function clearPreview(){
 // be more jarring than leaving it with an honest label.
 function stale(){
   if(!previewed) return;
-  previewed=false;
+  previewed=false;pendingBits=null;
   $("#btnpv").textContent="Preview";
-  $("#now").textContent="preview is out of date — press Preview";
+  $("#now").textContent="preview is out of date \u2014 press Preview";
 }
 
 function load(){
@@ -138,7 +221,7 @@ function load(){
     $("#dim").textContent=j.w+"\u00d7"+j.h;
     if(!previewed){ paint(j.preview,j.w,j.h); $("#now").textContent=cap; }
     if(j.mode!=="none"){
-      $(j.mode==="qr"?"#m2":"#m1").checked=true;
+      $(j.mode==="qr"?"#m2":(j.mode==="image"?"#m3":"#m1")).checked=true;
       $("#txt").value=j.text;
       $("#sz").value=j.size;
     }
@@ -164,28 +247,62 @@ function post(url,body,okmsg){
     }).catch(function(){busy(false);say("request failed","err")});
 }
 
+function doPrint(){
+  if(curMode()==="image"){
+    var b=new URLSearchParams();
+    b.set("bits",pendingBits||localBits());
+    b.set("text",$("#txt").value);
+    post("/api/image",b,"printed to the panel");
+  } else post("/api/display",params(),"printed to the panel");
+}
+
+function markPreviewed(){
+  previewed=true;
+  $("#btnpv").textContent="Print to panel";
+  $("#pvwrap").className="pending";
+  $("#now").textContent="preview \u2014 the panel has not been touched";
+  say("this is how it will look","ok");
+}
+
 $("#btnpv").addEventListener("click",function(){
-  if(previewed){ post("/api/display",params(),"printed to the panel"); return; }
+  if(previewed){ doPrint(); return; }
+  if(curMode()==="image"){
+    try{ pendingBits=localBits(); paint(pendingBits,W,H); markPreviewed(); }
+    catch(e){ say("could not render: "+e.message,"err"); }
+    return;
+  }
   busy(true);say("rendering\u2026");
   fetch("/api/preview",{method:"POST",body:params()}).then(function(r){return r.json()})
     .then(function(j){
       busy(false);
       if(!j.ok){say(j.error,"err");return}
       paint(j.preview,j.w,j.h);
-      previewed=true;
-      $("#btnpv").textContent="Print to panel";
-      $("#pvwrap").className="pending";
-      $("#now").textContent="preview \u2014 the panel has not been touched";
-      say("this is how it will look","ok");
+      markPreviewed();
     }).catch(function(){busy(false);say("request failed","err")});
 });
 
-$("#f").addEventListener("submit",function(e){e.preventDefault();post("/api/display",params())});
+$("#f").addEventListener("submit",function(e){e.preventDefault();doPrint()});
 $("#clr").addEventListener("click",function(){post("/api/clear",new URLSearchParams(),"panel cleared")});
 $("#m1").addEventListener("change",function(){syncMode();stale()});
 $("#m2").addEventListener("change",function(){syncMode();stale()});
 $("#sz").addEventListener("change",stale);
 $("#txt").addEventListener("input",function(){syncCount();stale()});
+$("#m3").addEventListener("change",function(){syncMode();stale()});
+$("#file").addEventListener("change",function(){
+  var f=this.files&&this.files[0];
+  if(!f){pic=null;stale();return}
+  var fr=new FileReader();
+  fr.onload=function(){
+    var im=new Image();
+    im.onload=function(){pic=im;stale();say("picture loaded \u2014 press Preview","ok")};
+    im.onerror=function(){say("could not read that image","err")};
+    im.src=fr.result;
+  };
+  fr.readAsDataURL(f);
+});
+$("#nofile").addEventListener("click",function(){
+  pic=null;$("#file").value="";stale();say("using the text instead","ok");
+});
 load();
 </script>
 </main></body></html>)HTML";

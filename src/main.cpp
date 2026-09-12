@@ -127,7 +127,13 @@ static const uint16_t CANVAS_STRIDE = (PANEL_W + 7) / 8;
 static const uint32_t CANVAS_BYTES  = (uint32_t)CANVAS_STRIDE * PANEL_H;
 
 // ── Content state ───────────────────────────────────────────────────────────
-enum Mode : uint8_t { MODE_NONE = 0, MODE_TEXT = 1, MODE_QR = 2 };
+enum Mode : uint8_t { MODE_NONE = 0, MODE_TEXT = 1, MODE_QR = 2, MODE_IMAGE = 3 };
+
+// A 1-bit frame rasterised by the browser: emoji, any font the phone has, an
+// uploaded picture, all resolved to the panel's own format before it arrives.
+// Same packing as GFXcanvas1 — MSB first, 1 = black ink.
+static uint8_t  g_image[CANVAS_BYTES];
+static bool     g_haveImage = false;
 
 static Mode     g_mode    = MODE_NONE;
 static String   g_text    = "";
@@ -205,6 +211,35 @@ static String base64(const uint8_t* data, size_t len) {
     o += '=';
   }
   return o;
+}
+
+static int8_t b64val(char c) {
+  if (c >= 'A' && c <= 'Z') return c - 'A';
+  if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+  if (c >= '0' && c <= '9') return c - '0' + 52;
+  if (c == '+') return 62;
+  if (c == '/') return 63;
+  return -1;                       // '=' and any whitespace land here
+}
+
+// Strict: decodes exactly outLen bytes or fails. Ignores characters outside the
+// alphabet so line breaks in transit are harmless.
+static bool base64Decode(const String& in, uint8_t* out, size_t outLen) {
+  uint32_t acc = 0;
+  uint8_t bits = 0;
+  size_t written = 0;
+  for (size_t i = 0; i < in.length(); i++) {
+    int8_t v = b64val(in[i]);
+    if (v < 0) continue;
+    acc = (acc << 6) | (uint8_t)v;
+    bits += 6;
+    if (bits >= 8) {
+      bits -= 8;
+      if (written >= outLen) return false;
+      out[written++] = (uint8_t)((acc >> bits) & 0xFF);
+    }
+  }
+  return written == outLen;
 }
 
 // The built-in GFX font only covers ASCII 32..126. Anything else would draw as
@@ -478,6 +513,11 @@ static void saveContent() {
   prefs.putUChar("mode", (uint8_t)g_mode);
   prefs.putUChar("size", g_size);
   prefs.putString("text", g_text);
+  if (g_mode == MODE_IMAGE && g_haveImage) {
+    size_t n = prefs.putBytes("image", g_image, CANVAS_BYTES);
+    if (n != CANVAS_BYTES) Serial.printf("[nvs] image save short: %u/%u bytes\n",
+                                         (unsigned)n, (unsigned)CANVAS_BYTES);
+  }
   prefs.end();
 }
 
@@ -486,14 +526,26 @@ static void loadContent() {
   g_mode = (Mode)prefs.getUChar("mode", MODE_NONE);
   g_size = prefs.getUChar("size", 2);
   g_text = prefs.getString("text", "");
+  if (g_mode == MODE_IMAGE) {
+    g_haveImage = (prefs.getBytesLength("image") == CANVAS_BYTES) &&
+                  (prefs.getBytes("image", g_image, CANVAS_BYTES) == CANVAS_BYTES);
+    if (!g_haveImage) Serial.println(F("[nvs] stored image missing or wrong size"));
+  }
   prefs.end();
   if (g_size < 1 || g_size > 3) g_size = 2;
-  if (g_mode != MODE_TEXT && g_mode != MODE_QR) g_mode = MODE_NONE;
+  if (g_mode == MODE_IMAGE && !g_haveImage) g_mode = MODE_NONE;
+  if (g_mode != MODE_TEXT && g_mode != MODE_QR && g_mode != MODE_IMAGE) g_mode = MODE_NONE;
 }
 
 // Renders into the canvas only; err is filled on rejection.
 static bool renderToCanvas(GFXcanvas1& c, Mode mode, const String& text, uint8_t size, String& err) {
   if (mode == MODE_NONE) { c.fillScreen(0); return true; }
+
+  if (mode == MODE_IMAGE) {
+    if (!g_haveImage) { err = "no image stored"; return false; }
+    memcpy(c.getBuffer(), g_image, CANVAS_BYTES);
+    return true;
+  }
 
   if (text.length() == 0) { err = "nothing to display"; return false; }
 
@@ -722,7 +774,7 @@ static void sendOk() {
 static void sendErr(const String& e)    { sendJson(400, String("{\"ok\":false,\"error\":\"") + jsonEscape(e) + "\"}"); }
 
 static const char* modeName(Mode m) {
-  return m == MODE_TEXT ? "text" : (m == MODE_QR ? "qr" : "none");
+  return m == MODE_TEXT ? "text" : (m == MODE_QR ? "qr" : (m == MODE_IMAGE ? "image" : "none"));
 }
 
 static void handleRoot() {
@@ -805,6 +857,24 @@ static void handleDisplay() {
   else                                  sendErr(err);
 }
 
+// Accepts a browser-rasterised frame: base64 of exactly CANVAS_BYTES packed
+// 1-bit pixels. `text` is the source string, kept only so the page can
+// repopulate its field; it is not re-rendered on the device.
+static void handleImage() {
+  const String bits = server.arg("bits");
+  if (bits.length() == 0) { sendErr("missing image data"); return; }
+  if (!base64Decode(bits, g_image, CANVAS_BYTES)) {
+    sendErr(String("image must decode to exactly ") + CANVAS_BYTES + " bytes ("
+            + PANEL_W + "x" + PANEL_H + ", 1 bit per pixel)");
+    return;
+  }
+  g_haveImage = true;
+
+  String err;
+  if (applyContent(MODE_IMAGE, server.arg("text"), g_size, err)) sendOk();
+  else                                                           sendErr(err);
+}
+
 static void handleClear() {
   String err;
   if (applyContent(MODE_NONE, "", g_size, err)) sendOk();
@@ -859,6 +929,7 @@ static void serverBegin() {
   server.on("/api/scan",    HTTP_GET,  handleScan);
   server.on("/api/preview", HTTP_POST, handlePreview);
   server.on("/api/display", HTTP_POST, handleDisplay);
+  server.on("/api/image",   HTTP_POST, handleImage);
   server.on("/api/clear",   HTTP_POST, handleClear);
   server.on("/api/wifi",    HTTP_POST, handleWifiSave);
   server.onNotFound(handleNotFound);
