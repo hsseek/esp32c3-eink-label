@@ -90,7 +90,7 @@ showing its last content the whole time.
 **Web UI** — open the label's address:
 
 - text field for the content
-- TEXT / QR / IMAGE toggle
+- TEXT / QR / TEXT+ / IMAGE toggle
 - font size small / medium / large (TEXT only)
 - **Preview** — renders on the device and shows the result in the page *without
   touching the panel*, so you can check the wrap, the truncation or the QR size
@@ -134,7 +134,7 @@ Oversized payloads are refused with a message rather than drawn as garbage:
 |------|-------|
 | TEXT | 400 characters (`MAX_TEXT_LEN`). Text that wraps past the panel height is truncated with `...` |
 | QR   | whatever fits QR version 10 at ECC-M (~270 bytes). Longer payloads are rejected — bigger versions would be too dense to scan at 122 px |
-| IMAGE | exactly 3904 bytes once decoded (250 × 122, 1 bit per pixel). Anything else is rejected |
+| TEXT+ / IMAGE | exactly 3904 bytes once decoded (250 × 122, 1 bit per pixel). Anything else is rejected |
 
 ### Emoji, Hangul and pictures — IMAGE mode
 
@@ -142,12 +142,22 @@ The device has no glyph data beyond a 5 × 7 ASCII table, so **TEXT mode folds
 anything outside ASCII 32–126 to `?`** — emoji, Hangul, accented Latin. QR mode
 is unaffected, since it encodes raw bytes.
 
-IMAGE mode sidesteps the problem entirely: the browser already has every font
-and emoji on the phone, so the page rasterises there. It renders your text (or a
-picture you choose) onto a 250 × 122 canvas, converts it to 1 bit with
-Floyd–Steinberg dithering, and posts the finished 3904-byte frame as base64 to
-`POST /api/image`. The device decodes it, blits it, and keeps it in NVS, so it
-comes back after a reboot. Nothing is re-rendered on the device.
+Two tabs sidestep the problem by rasterising in the browser, which already has
+every font and emoji on the phone:
+
+- **TEXT+** — type anything, including emoji and Hangul. The page lays it out
+  with your phone's own fonts at the chosen size.
+- **IMAGE** — pick a picture. Scaled to fit and centred.
+
+Each tab has exactly one input, so there is nothing to reset when switching. The
+result goes onto a 250 × 122 canvas, is converted to 1 bit with Floyd–Steinberg
+dithering, and posted as a base64 3904-byte frame to `POST /api/image`. The
+device decodes, blits and stores it in NVS, so it survives a reboot. Nothing is
+re-rendered on the device, and preview for these tabs is instant because the
+bitmap already exists in the browser.
+
+Both tabs store the same device-side mode. The source string tells them apart on
+reload — IMAGE never sends one.
 
 Dithering rather than a hard threshold matters here: a bright yellow emoji is
 high-luminance and would simply disappear under a threshold, but becomes a
@@ -158,9 +168,11 @@ Two things to expect:
 
 - **The panel is 1 bit, so emoji arrive as silhouettes.** High-contrast
   pictograms (✓ ★ ♥ ⚠ ↑) read well. Detailed or pale ones often do not.
-- **IMAGE mode is browser-only.** The serial protocol has no way to send a
-  frame, so `TEXT:` and `QR:` remain ASCII-only. The stored source string is
-  kept purely so the page can repopulate its field.
+- **TEXT+ and IMAGE are browser-only.** The serial protocol has no way to send
+  a frame, so `TEXT:` and `QR:` remain ASCII-only.
+- **Plain TEXT is still worth using for ASCII.** The device's 5 × 7 bitmap font
+  is crisper on a 1-bit panel than antialiased browser text dithered down to it,
+  and its content round-trips as a string rather than a frame.
 
 To render Hangul from the device itself instead, you would need an Adafruit GFX
 bitmap font containing those glyphs; note that `renderTextToCanvas()` wraps on a

@@ -60,23 +60,25 @@ a{color:var(--acc)}
   <div class="seg">
     <input type="radio" name="mode" id="m1" value="text" checked><label for="m1">TEXT</label>
     <input type="radio" name="mode" id="m2" value="qr"><label for="m2">QR</label>
-    <input type="radio" name="mode" id="m3" value="image"><label for="m3">IMAGE</label>
+    <input type="radio" name="mode" id="m3" value="rich"><label for="m3">TEXT+</label>
+    <input type="radio" name="mode" id="m4" value="image"><label for="m4">IMAGE</label>
   </div>
-  <textarea id="txt" placeholder="What should the label say?" maxlength="400"></textarea>
-  <div class="row">
-    <label class="fld" id="szrow">Font size
-      <select id="sz">
-        <option value="1">Small</option>
-        <option value="2" selected>Medium</option>
-        <option value="3">Large</option>
-      </select>
-    </label>
-    <span class="muted" id="cnt">0</span>
+  <div id="txtrow">
+    <textarea id="txt" placeholder="What should the label say?" maxlength="400"></textarea>
+    <div class="row">
+      <label class="fld" id="szrow">Font size
+        <select id="sz">
+          <option value="1">Small</option>
+          <option value="2" selected>Medium</option>
+          <option value="3">Large</option>
+        </select>
+      </label>
+      <span class="muted" id="cnt">0</span>
+    </div>
   </div>
   <div class="hide" id="imgrow">
-    <label class="fld" for="file">Picture &mdash; leave empty to render the text above</label>
+    <label class="fld" for="file">Picture &mdash; scaled to fit and dithered to 1 bit</label>
     <input type="file" id="file" accept="image/*">
-    <button type="button" class="ghost" id="nofile">Clear picture</button>
   </div>
   <button id="btnpv" type="button">Preview</button>
   <button id="go" type="submit" class="ghost">Print now</button>
@@ -108,15 +110,20 @@ function paint(b64,w,h){
   ctx.putImageData(img,0,0);
 }
 
-function curMode(){return $("#m1").checked?"text":($("#m2").checked?"qr":"image")}
+function curMode(){
+  return $("#m1").checked?"text":$("#m2").checked?"qr":$("#m3").checked?"rich":"image";
+}
+// Each tab has exactly one source, so there is never a stale input to clear.
 function syncMode(){
   var m=curMode();
+  $("#txtrow").className=(m==="image")?"hide":"";
   $("#szrow").className=(m==="qr")?"fld hide":"fld";
   $("#imgrow").className=(m==="image")?"":"hide";
   $("#txt").placeholder = m==="qr" ? "URL or text to encode"
-    : m==="image" ? "Text, emoji, any script your phone can draw"
+    : m==="rich" ? "Emoji, Hangul, any script your phone can draw"
     : "What should the label say?";
 }
+function isLocal(){var m=curMode();return m==="rich"||m==="image"}
 
 // ---- IMAGE mode: the phone rasterises, the panel just blits ----------------
 // The device has no glyphs beyond 5x7 ASCII, but this browser already has every
@@ -128,7 +135,8 @@ function sizePx(){return {"1":13,"2":19,"3":27}[$("#sz").value]||19}
 
 function drawSource(ctx){
   ctx.fillStyle="#fff";ctx.fillRect(0,0,W,H);
-  if(pic){
+  if(curMode()==="image"){
+    if(!pic) throw new Error("choose a picture first");
     var s=Math.min(W/pic.width,H/pic.height);
     var dw=Math.max(1,Math.round(pic.width*s)),dh=Math.max(1,Math.round(pic.height*s));
     ctx.drawImage(pic,(W-dw)>>1,(H-dh)>>1,dw,dh);
@@ -221,7 +229,9 @@ function load(){
     $("#dim").textContent=j.w+"\u00d7"+j.h;
     if(!previewed){ paint(j.preview,j.w,j.h); $("#now").textContent=cap; }
     if(j.mode!=="none"){
-      $(j.mode==="qr"?"#m2":(j.mode==="image"?"#m3":"#m1")).checked=true;
+      // The device stores both bitmap tabs as one mode; the source string tells
+      // them apart, since IMAGE never sends one.
+      $(j.mode==="qr"?"#m2":j.mode==="image"?(j.text?"#m3":"#m4"):"#m1").checked=true;
       $("#txt").value=j.text;
       $("#sz").value=j.size;
     }
@@ -248,12 +258,14 @@ function post(url,body,okmsg){
 }
 
 function doPrint(){
-  if(curMode()==="image"){
-    var b=new URLSearchParams();
-    b.set("bits",pendingBits||localBits());
-    b.set("text",$("#txt").value);
-    post("/api/image",b,"printed to the panel");
-  } else post("/api/display",params(),"printed to the panel");
+  if(!isLocal()){ post("/api/display",params(),"printed to the panel"); return; }
+  var b=new URLSearchParams();
+  try{ b.set("bits",pendingBits||localBits()); }
+  catch(e){ say(e.message,"err"); return; }
+  // Kept only so the page can repopulate its field, and so a reload knows
+  // which of the two bitmap tabs produced this frame.
+  b.set("text",curMode()==="rich"?$("#txt").value:"");
+  post("/api/image",b,"printed to the panel");
 }
 
 function markPreviewed(){
@@ -266,9 +278,9 @@ function markPreviewed(){
 
 $("#btnpv").addEventListener("click",function(){
   if(previewed){ doPrint(); return; }
-  if(curMode()==="image"){
+  if(isLocal()){
     try{ pendingBits=localBits(); paint(pendingBits,W,H); markPreviewed(); }
-    catch(e){ say("could not render: "+e.message,"err"); }
+    catch(e){ say(e.message,"err"); }
     return;
   }
   busy(true);say("rendering\u2026");
@@ -288,6 +300,7 @@ $("#m2").addEventListener("change",function(){syncMode();stale()});
 $("#sz").addEventListener("change",stale);
 $("#txt").addEventListener("input",function(){syncCount();stale()});
 $("#m3").addEventListener("change",function(){syncMode();stale()});
+$("#m4").addEventListener("change",function(){syncMode();stale()});
 $("#file").addEventListener("change",function(){
   var f=this.files&&this.files[0];
   if(!f){pic=null;stale();return}
@@ -300,9 +313,7 @@ $("#file").addEventListener("change",function(){
   };
   fr.readAsDataURL(f);
 });
-$("#nofile").addEventListener("click",function(){
-  pic=null;$("#file").value="";stale();say("using the text instead","ok");
-});
+
 load();
 </script>
 </main></body></html>)HTML";
