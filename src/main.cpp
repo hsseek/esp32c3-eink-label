@@ -71,10 +71,18 @@ static const uint16_t PANEL_H = EPD_PANEL_CLASS::WIDTH_VISIBLE;
 
 // ── Tunables ────────────────────────────────────────────────────────────────
 static const uint8_t  FULL_REFRESH_EVERY = 10;   // partial updates between full ones
+// The panel is powered off (charge pump disabled) immediately after every draw,
+// which is what protects the film from being left under drive voltage. Deep
+// sleep is a separate, weaker concern: it saves microamps we do not care about
+// on USB power, and it COSTS us partial refresh, because waking from it resets
+// the controller and wipes the previous-image RAM. So hibernate only once the
+// label has genuinely gone idle; the draw that wakes it is forced to full.
+static const uint32_t PANEL_HIBERNATE_AFTER_MS = 300000;   // 5 minutes
 static const uint16_t MAX_TEXT_LEN       = 400;  // chars accepted in TEXT mode
 static const uint8_t  QR_MAX_VERSION     = 10;   // 57x57 modules; bigger is unreadable here
 static const uint8_t  QR_ECC             = ECC_MEDIUM;
 static const uint8_t  QR_QUIET           = 4;    // quiet zone, in modules
+static const uint8_t  QR_MIN_SCALE       = 2;    // px per module; 1 is unscannable here
 static const char*    AP_SSID            = "eink-setup";
 // 2.4 GHz channel for the setup AP. Channel 1 is the arduino-esp32 default and
 // is usually the most contended; a beacon from a bare-PCB-antenna board can be
@@ -112,6 +120,8 @@ static uint32_t g_updates = 0;
 
 static bool     g_drawnSinceBoot   = false;
 static uint8_t  g_partialsSinceFull = 0;
+static bool     g_panelAsleep       = true;   // true = controller RAM is not valid
+static uint32_t g_lastDrawMs        = 0;
 
 // ── Network state ───────────────────────────────────────────────────────────
 static Preferences prefs;
@@ -281,24 +291,49 @@ static void renderTextToCanvas(const String& raw, uint8_t size) {
 
 // Picks the smallest QR version that holds the payload, then the largest whole
 // module size that still leaves a 4-module quiet zone. Centered.
+// Byte-mode capacity in bytes, [ecc][version-1], versions 1..QR_MAX_VERSION.
+//
+// ricmoo/QRCode does NOT range-check the payload against the version it is
+// handed: qrcode_initBytes() only fails when it cannot choose an encoding mode,
+// never on overflow. Feeding it too much data yields a structurally invalid,
+// unscannable code with no error at all, so the fit test has to live here.
+// Byte mode is the conservative choice — a numeric or alphanumeric payload may
+// fit a smaller version than this table admits, which only costs module size.
+static const uint16_t QR_BYTE_CAPACITY[4][QR_MAX_VERSION] = {
+  { 17, 32, 53, 78, 106, 134, 154, 192, 230, 271 },  // ECC_LOW
+  { 14, 26, 42, 62,  84, 106, 122, 152, 180, 213 },  // ECC_MEDIUM
+  { 11, 20, 32, 46,  60,  74,  86, 108, 130, 151 },  // ECC_QUARTILE
+  {  7, 14, 24, 34,  44,  58,  64,  84,  98, 119 },  // ECC_HIGH
+};
+
 static bool renderQrToCanvas(const String& payload, String& err) {
   static uint8_t qrBuf[QR_BUF_BYTES];
   QRCode qr;
   uint8_t version = 0;
+  const uint16_t len = payload.length();
 
   for (uint8_t v = 1; v <= QR_MAX_VERSION; v++) {
-    if (qrcode_initText(&qr, qrBuf, v, QR_ECC, payload.c_str()) == 0) { version = v; break; }
+    if (len <= QR_BYTE_CAPACITY[QR_ECC][v - 1]) { version = v; break; }
   }
   if (!version) {
-    err = String("payload too long for a readable QR (max version ") + QR_MAX_VERSION + ")";
+    err = String("QR payload too long: ") + len + " bytes, limit "
+        + QR_BYTE_CAPACITY[QR_ECC][QR_MAX_VERSION - 1];
+    return false;
+  }
+  if (qrcode_initText(&qr, qrBuf, version, QR_ECC, payload.c_str()) != 0) {
+    err = "QR encoding failed";
     return false;
   }
 
   const uint16_t modules = qr.size;
   const uint16_t total   = modules + 2 * QR_QUIET;
   uint16_t scale = min(PANEL_W / total, PANEL_H / total);
-  if (scale < 1) {
-    err = "QR does not fit the panel with a quiet zone";
+  if (scale < QR_MIN_SCALE) {
+    // One pixel per module on a 0.19 mm pitch panel cannot be scanned; refuse
+    // rather than draw a code nothing can read.
+    err = String("QR payload too long to stay scannable: ") + len
+        + " bytes needs version " + version + " (" + modules + " modules), "
+        "which leaves only " + scale + " px per module";
     return false;
   }
 
@@ -337,30 +372,54 @@ static void displayBegin() {
   display.setRotation(1);                     // landscape, 250 x 122
 }
 
-// Copies the canvas to the panel. Full refresh on the first draw after boot and
-// every FULL_REFRESH_EVERY partials, to clear ghosting; partial otherwise.
-// The panel is hibernated afterwards — never left powered idle.
-static void pushCanvas() {
-  const bool full = (!g_drawnSinceBoot) || (g_partialsSinceFull >= FULL_REFRESH_EVERY);
+// Copies the canvas to the panel.
+//
+// A fast partial refresh on the SSD1680 drives the transition between the
+// controller's previous-image RAM (0x26) and current RAM (0x24). GxEPD2 keeps
+// 0x26 in step for us via writeImageAgain() after each refresh — but ONLY while
+// the controller is never reset. Waking from hibernate resets it and leaves
+// 0x26 undefined, so the next partial update transitions from garbage and the
+// old image stays on the glass. Hence: full refresh whenever the RAM cannot be
+// trusted (first draw after boot, or after hibernate), on an explicit clear, and
+// every FULL_REFRESH_EVERY partials to sweep up accumulated ghosting.
+static void pushCanvas(bool forceFull = false) {
+  const bool full = forceFull || !g_drawnSinceBoot || g_panelAsleep ||
+                    (g_partialsSinceFull >= FULL_REFRESH_EVERY);
 
   if (full) display.setFullWindow();
   else      display.setPartialWindow(0, 0, PANEL_W, PANEL_H);
 
+  const uint32_t t0 = millis();
   display.firstPage();
   do {
     display.fillScreen(GxEPD_WHITE);
     display.drawBitmap(0, 0, canvas.getBuffer(), PANEL_W, PANEL_H, GxEPD_BLACK, GxEPD_WHITE);
   } while (display.nextPage());
+  const uint32_t ms = millis() - t0;
 
-  display.hibernate();
+  // Charge pump off, controller left awake so its previous-image RAM survives
+  // and the next update can be a partial one.
+  display.powerOff();
+  g_panelAsleep = false;
+  g_lastDrawMs = millis();
 
   if (full) g_partialsSinceFull = 0;
   else      g_partialsSinceFull++;
   g_drawnSinceBoot = true;
   g_updates++;
 
-  Serial.printf("[epd] %s refresh done (%u partial since full)\n",
-                full ? "full" : "partial", g_partialsSinceFull);
+  Serial.printf("[epd] %s refresh in %lu ms (%u partial since full)\n",
+                full ? "full" : "partial", (unsigned long)ms, g_partialsSinceFull);
+}
+
+// Deep-sleep the controller once the label has been idle a while. This throws
+// away the previous-image RAM, so pushCanvas() forces a full refresh next time.
+static void panelTick() {
+  if (g_panelAsleep || !g_drawnSinceBoot) return;
+  if (millis() - g_lastDrawMs < PANEL_HIBERNATE_AFTER_MS) return;
+  display.hibernate();
+  g_panelAsleep = true;
+  Serial.println(F("[epd] idle — panel hibernated; next draw will be full"));
 }
 
 // ============================================================================
@@ -408,7 +467,8 @@ static bool applyContent(Mode mode, const String& text, uint8_t size, String& er
   g_mode = mode;
   g_text = (mode == MODE_NONE) ? "" : text;
   if (mode == MODE_TEXT) g_size = size;
-  pushCanvas();
+  // A clear must leave the glass genuinely blank, so never do it differentially.
+  pushCanvas(mode == MODE_NONE);
   saveContent();
   return true;
 }
@@ -913,6 +973,7 @@ void loop() {
   server.handleClient();
   netTick();
   serialTick();
+  panelTick();
 
   if (g_rebootAt && millis() > g_rebootAt) {
     Serial.println(F("[sys] rebooting with new credentials"));

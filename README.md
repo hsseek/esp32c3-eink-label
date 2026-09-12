@@ -149,6 +149,48 @@ Tunables at the top of `main.cpp`: `FULL_REFRESH_EVERY`, `MAX_TEXT_LEN`,
 An e-paper panel never reports errors — a wrong setting just leaves you with a
 white rectangle. Work down this list; the first two cover most cases.
 
+### Old content stays on screen under the new content
+
+Ghosting where the previous image remains visible, overlapping the new one, is
+not a panel defect — it is `hibernate()` and partial refresh being mutually
+exclusive.
+
+The SSD1680 holds two buffers: `0x24` (current) and `0x26` (previous). A fast
+partial refresh drives the *transition* between them, and GxEPD2 keeps `0x26` in
+step by calling `writeImageAgain()` after each refresh. That bookkeeping only
+survives while the controller is never reset. `hibernate()` issues deep-sleep
+command `0x10`, so waking requires a hardware reset, which wipes `0x26` — the
+next partial update then transitions from undefined data and leaves the old ink
+behind. The first draw after boot looks fine because GxEPD2 forces the initial
+refresh to be full.
+
+This firmware therefore calls **`powerOff()`** after every draw, not
+`hibernate()`. `powerOff()` disables the charge pump, which is what actually
+protects the film from being left under drive voltage; it leaves the controller
+awake so its RAM stays valid and partial updates keep working. Deep sleep only
+saves microamps, which is irrelevant on USB power, so it is deferred to
+`PANEL_HIBERNATE_AFTER_MS` (5 minutes) of idle — and the draw that wakes the
+panel is forced to a full refresh, since the RAM is gone by then.
+
+A full refresh is also forced on the first draw after boot, on `CLEAR`, and
+every `FULL_REFRESH_EVERY` partial updates.
+
+### QR codes that will not scan
+
+`ricmoo/QRCode` does **not** check that a payload fits the version it is given.
+`qrcode_initBytes()` returns an error only when it cannot choose an encoding
+mode, never on overflow, so asking it for version 1 with 30 bytes of data
+produces a structurally valid-looking but unscannable code with no error at all.
+
+Do not write "try version 1, then 2, then 3 until it stops failing" — it never
+fails. This firmware carries its own `QR_BYTE_CAPACITY` table and picks the
+version from the payload length before calling the library. If you raise
+`QR_MAX_VERSION`, extend that table to match.
+
+Codes are also refused below `QR_MIN_SCALE` (2 px per module). At this panel's
+~0.19 mm pitch a one-pixel module cannot be read by a phone, so an over-long
+payload returns an error rather than drawing something useless.
+
 ### 1. Wrong GxEPD2 panel class
 
 The most common cause. Every 2.13" revision uses a different controller init
@@ -302,15 +344,16 @@ arduino-esp32 logs this to say there is no default MISO to fall back to. The
 only way to remove it is to hand SPI a real pin we don't need.
 
 ```
-_PowerOn : 3
-_Update_Full : 0
-_PowerOff : 0
+_PowerOn : 95999
+_Update_Part : 450001
+_PowerOff : 140001
 ```
 
-GxEPD2 timing diagnostics, in milliseconds. Values near zero mean the BUSY line
-never went busy — normal with no panel attached (GPIO4 floats low). With the
-panel wired, a full refresh should report roughly 2000 ms. **Zero timings with
-the panel connected means BUSY is not reaching GPIO4** — see section 2.
+GxEPD2 timing diagnostics, in **microseconds** (not milliseconds). Healthy
+values on this panel: power-on ~96 ms, partial refresh ~450 ms, full refresh
+~2130 ms. **Values near zero mean the BUSY line never went busy** — normal with
+no panel attached, since GPIO4 floats low, but with the panel wired it means
+BUSY is not reaching GPIO4. See section 2.
 
 ### 6. Nothing at all on serial
 
