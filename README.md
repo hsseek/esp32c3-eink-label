@@ -423,8 +423,10 @@ It appears in the boot banner, in `STATUS`, at the foot of the main page, and in
 file picker, so reloading it after a reboot tells you whether the upload took —
 which otherwise looks identical to one that silently failed.
 
-A `+` suffix means the tree had uncommitted changes when it was built, so the
-hash alone does not describe what is running. The hash is HEAD *at build time*,
+A `+` suffix means the **source** had uncommitted changes when it was built, so
+the hash alone does not describe what is running. `firmware/` is excluded from
+that check — copying a freshly built image into the tree would otherwise mark
+the next build dirty, and every shipped binary would carry a meaningless `+`. The hash is HEAD *at build time*,
 so a binary committed afterwards names the commit its source came from, not the
 commit containing the binary.
 

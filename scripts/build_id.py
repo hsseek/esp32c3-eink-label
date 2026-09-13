@@ -23,7 +23,12 @@ def _git(*args):
 stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%MZ")
 head = _git("rev-parse", "--short=7", "HEAD")
 if head:
-    dirty = subprocess.call(("git", "diff", "--quiet", "HEAD"), stderr=subprocess.DEVNULL) != 0
+    # Exclude firmware/: copying a freshly built image into the tree would
+    # otherwise mark the NEXT build dirty, so every shipped binary would carry a
+    # '+' that says nothing about its source. The flag has to mean what it says.
+    dirty = subprocess.call(
+        ("git", "diff", "--quiet", "HEAD", "--", ".", ":(exclude)firmware/"),
+        stderr=subprocess.DEVNULL) != 0
     build_id = "%s %s%s" % (stamp, head, "+" if dirty else "")
 else:
     build_id = stamp                      # built outside a git checkout
