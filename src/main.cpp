@@ -114,6 +114,15 @@ static const uint8_t  QR_MAX_VERSION     = 10;   // 57x57 modules, the largest t
 // panel is no worse than its white bezel -- it gives the detector a firmer edge
 // -- so this does not depend on how the label is mounted.
 static const uint8_t  QR_QUIET_MIN       = 2;
+// The border may drop to this, but ONLY when doing so lifts a code off
+// QR_MIN_SCALE -- see planQr(). Applied unconditionally it makes things worse:
+// with 4 px modules the scanner has no trouble resolving cells and what limits
+// it is finding the code's edge, so a 12-byte payload measured 92 cm at border
+// 2 and 74 cm at border 1. With 2 px modules the opposite holds -- the scanner
+// is struggling to resolve cells at all, and a whole extra pixel per module
+// dwarfs the border: an 82-byte payload went 41 cm to 57 cm. Below 3 px per
+// module the 1-vs-2 module border barely registers either way.
+static const uint8_t  QR_QUIET_RESCUE    = 1;
 static const uint8_t  QR_MIN_SCALE       = 2;    // px per module; 1 is unscannable here
 // Maximum deviation from centre, per axis, when placing a QR code. Spreads
 // panel wear without making the layout look accidental -- see renderQrToCanvas.
@@ -408,10 +417,11 @@ struct QrPlan {
   uint8_t  version;    // 1..QR_MAX_VERSION
   uint8_t  ecc;        // ECC_LOW..ECC_HIGH
   uint8_t  scale;      // px per module — what actually decides readability
+  uint8_t  quiet;      // border reserved, in modules
   uint16_t modules;    // 4 * version + 17
   uint16_t side;       // modules * scale, in px
 };
-static QrPlan g_qrPlan      = {0, 0, 0, 0, 0};   // of the frame on the glass
+static QrPlan g_qrPlan      = {0, 0, 0, 0, 0, 0};   // of the frame on the glass
 static bool   g_qrPlanValid = false;
 
 // Chooses the (version, error-correction) pair giving the LARGEST module,
@@ -428,7 +438,8 @@ static bool   g_qrPlanValid = false;
 // Fixing ECC at MEDIUM (as this used to) throws that away: a 60-byte payload
 // took version 4 at 2 px per module, 66 px on a 122 px panel, when version 4 at
 // 3 px per module — 99 px — was available the whole time.
-static bool planQr(uint16_t len, uint16_t availW, uint16_t availH, QrPlan& out) {
+static bool planQrAt(uint16_t len, uint16_t availW, uint16_t availH,
+                     uint8_t quiet, QrPlan& out) {
   bool found = false;
   for (int8_t e = ECC_HIGH; e >= ECC_LOW; e--) {          // strongest first
     uint8_t v = 0;
@@ -437,19 +448,37 @@ static bool planQr(uint16_t len, uint16_t availW, uint16_t availH, QrPlan& out) 
     }
     if (!v) continue;                                     // too long for this level
     const uint16_t modules = 4u * v + 17u;
-    const uint16_t total   = modules + 2u * QR_QUIET_MIN;
+    const uint16_t total   = modules + 2u * quiet;
     const uint16_t scale   = min(availW / total, availH / total);
     if (scale < QR_MIN_SCALE) continue;
     if (!found || scale > out.scale) {
       out.version = v;
       out.ecc     = (uint8_t)e;
       out.scale   = (uint8_t)scale;
+      out.quiet   = quiet;
       out.modules = modules;
       out.side    = modules * scale;
       found = true;
     }
   }
   return found;
+}
+
+// Normally reserves QR_QUIET_MIN modules of border. If the best that yields is
+// still the bare minimum module size, try again at QR_QUIET_RESCUE and keep the
+// result only if it actually buys a bigger module — trading border for module
+// size is worth it exactly there, and nowhere else. Rescues payloads of roughly
+// 79-106 bytes, with no length made worse.
+static bool planQr(uint16_t len, uint16_t availW, uint16_t availH, QrPlan& out) {
+  if (!planQrAt(len, availW, availH, QR_QUIET_MIN, out)) return false;
+  if (out.scale == QR_MIN_SCALE) {
+    QrPlan rescued;
+    if (planQrAt(len, availW, availH, QR_QUIET_RESCUE, rescued) &&
+        rescued.scale > out.scale) {
+      out = rescued;
+    }
+  }
+  return true;
 }
 
 static uint32_t strHash(const String& s) {                // FNV-1a
@@ -494,17 +523,30 @@ static bool renderQrToCanvas(GFXcanvas1& c, const String& payload,
   // would cost a full 2.4 s refresh. It is also bounded to QR_JITTER_PX rather
   // than filling the available slack: a code wandering 70 px across the panel
   // reads as a bug, not as care.
-  const int16_t quiet  = (int16_t)QR_QUIET_MIN * plan.scale;
-  const uint32_t h     = strHash(payload);
-  const int16_t jx     = (int16_t)(h % (2u * QR_JITTER_PX + 1u)) - QR_JITTER_PX;
-  const int16_t jy     = (int16_t)((h >> 16) % (2u * QR_JITTER_PX + 1u)) - QR_JITTER_PX;
+  // Jitter is bounded by the COMFORTABLE border (QR_QUIET_MIN), not by whatever
+  // the plan settled for. When the rescue border is in play the two collide --
+  // there is no room for 2 modules on both sides at once -- and the axis is
+  // simply centred instead. Letting jitter spend the rescued border would give
+  // back the range the bigger module just bought: measured on the panel, an
+  // 85-byte code pushed to a 1.0-module margin read to 34 cm against a dark
+  // surround, where the centred 1.7-module version reads to 51 cm.
+  const uint32_t h  = strHash(payload);
+  const int16_t safe = (int16_t)QR_QUIET_MIN * plan.scale;
+  const int16_t cx0 = areaX + ((int16_t)areaW   - (int16_t)plan.side) / 2;
+  const int16_t cy0 =         ((int16_t)PANEL_H - (int16_t)plan.side) / 2;
 
-  int16_t ox = areaX + ((int16_t)areaW   - (int16_t)plan.side) / 2 + jx;
-  int16_t oy =         ((int16_t)PANEL_H - (int16_t)plan.side) / 2 + jy;
-  const int16_t xLo = areaX + quiet, xHi = areaX + (int16_t)areaW - plan.side - quiet;
-  const int16_t yLo = quiet,         yHi = (int16_t)PANEL_H - plan.side - quiet;
-  if (ox < xLo) ox = xLo;  if (ox > xHi) ox = xHi;
-  if (oy < yLo) oy = yLo;  if (oy > yHi) oy = yHi;
+  const int16_t xLo = areaX + safe, xHi = areaX + (int16_t)areaW - plan.side - safe;
+  const int16_t yLo = safe,         yHi = (int16_t)PANEL_H - plan.side - safe;
+
+  int16_t ox = cx0, oy = cy0;
+  if (xLo <= xHi) {
+    ox += (int16_t)(h % (2u * QR_JITTER_PX + 1u)) - QR_JITTER_PX;
+    if (ox < xLo) ox = xLo;  if (ox > xHi) ox = xHi;
+  }
+  if (yLo <= yHi) {
+    oy += (int16_t)((h >> 16) % (2u * QR_JITTER_PX + 1u)) - QR_JITTER_PX;
+    if (oy < yLo) oy = yLo;  if (oy > yHi) oy = yHi;
+  }
 
   for (uint16_t y = 0; y < plan.modules; y++) {
     for (uint16_t x = 0; x < plan.modules; x++) {
@@ -513,9 +555,10 @@ static bool renderQrToCanvas(GFXcanvas1& c, const String& payload,
       }
     }
   }
-  Serial.printf("[qr] v%u %s %ux%u modules, %u px/module, %u px, at %d,%d\n",
+  Serial.printf("[qr] v%u %s %ux%u modules, %u px/module, %u px, border %u, at %d,%d%s\n",
                 plan.version, QR_ECC_NAME[plan.ecc], plan.modules, plan.modules,
-                plan.scale, plan.side, ox, oy);
+                plan.scale, plan.side, plan.quiet, ox, oy,
+                plan.scale <= QR_MIN_SCALE ? "  [at the readability limit]" : "");
   return true;
 }
 
@@ -686,7 +729,7 @@ static bool renderToCanvas(GFXcanvas1& c, Mode mode, const String& text,
   }
   const bool hasCap    = caption.length() > 0;
   const uint16_t qrW   = hasCap ? PANEL_H : PANEL_W;
-  QrPlan plan = {0, 0, 0, 0, 0};
+  QrPlan plan = {0, 0, 0, 0, 0, 0};
   c.fillScreen(0);
   if (!renderQrToCanvas(c, text, 0, qrW, plan, err)) return false;
   if (hasCap) {
@@ -699,7 +742,7 @@ static bool renderToCanvas(GFXcanvas1& c, Mode mode, const String& text,
 
 static bool applyContent(Mode mode, const String& text, const String& caption,
                          uint8_t size, String& err) {
-  QrPlan plan = {0, 0, 0, 0, 0};
+  QrPlan plan = {0, 0, 0, 0, 0, 0};
   if (!renderToCanvas(canvas, mode, text, caption, size, err, &plan)) return false;
   g_mode    = mode;
   g_text    = (mode == MODE_NONE) ? "" : text;
@@ -912,6 +955,8 @@ static String qrInfoJson(const QrPlan& p) {
   j += "\",\"modules\":";     j += p.modules;
   j += ",\"scale\":";         j += p.scale;
   j += ",\"side\":";          j += p.side;
+  j += ",\"quiet\":";         j += p.quiet;
+  j += ",\"atLimit\":";       j += (p.scale <= QR_MIN_SCALE) ? "true" : "false";
   j += ",\"mm\":\"";          j += String(p.scale * 48.55f / 250.0f, 2);
   j += "\"}";
   return j;
@@ -990,7 +1035,7 @@ static void handlePreview() {
   else { sendErr("mode must be \"text\" or \"qr\""); return; }
 
   String err;
-  QrPlan plan = {0, 0, 0, 0, 0};
+  QrPlan plan = {0, 0, 0, 0, 0, 0};
   if (!renderToCanvas(scratch, m, text, cap, size, err, &plan)) { sendErr(err); return; }
 
   String j;
@@ -1275,7 +1320,7 @@ void setup() {
   loadContent();
   if (g_mode != MODE_NONE) {
     String err;
-    QrPlan plan = {0, 0, 0, 0, 0};
+    QrPlan plan = {0, 0, 0, 0, 0, 0};
     if (renderToCanvas(canvas, g_mode, g_text, g_caption, g_size, err, &plan)) {
       g_qrPlanValid = (g_mode == MODE_QR);
       if (g_qrPlanValid) g_qrPlan = plan;

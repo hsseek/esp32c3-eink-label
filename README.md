@@ -287,8 +287,39 @@ still ends up with a 3.7-cell border. Tested against a simulated phone camera,
 the panel is no worse than its white bezel, since it gives the detector a firmer
 edge. So this does not depend on how the label is mounted.
 
+**One exception, in the band where it matters.** Whether the border or the cell
+size is the binding constraint depends on which one the scanner is struggling
+with, and the two swap places:
+
+| payload | border 2 | border 1 | scan range |
+|---------|----------|----------|------------|
+| 12 chars | 4 px cells, 100 px | 5 px cells, 105 px | 92 → **74 cm** ✗ |
+| 82 chars | 2 px cells, 98 px | 3 px cells, 111 px | 41 → **57 cm** ✓ |
+
+At 4 px per cell the scanner resolves cells easily and what limits it is finding
+the code's edge, so a narrower border costs range outright. At 2 px it is
+struggling to resolve cells at all, and a whole extra pixel per cell dwarfs
+anything the border does.
+
+So `QR_QUIET_RESCUE` (1 cell) is used **only when it lifts a code off the 2 px
+floor** — payloads of roughly 79–106 characters. Across all 271 lengths that
+rescues 28 and makes none worse.
+
+Measured on the panel, same 85-character payload through three generations of
+this firmware:
+
+| | code | cell | border | scan range |
+|---|---|---|---|---|
+| ECC fixed at Medium, border 4 | 82 px | 0.39 mm | 10 cells | 32 cm |
+| all four ECC levels, border 2 | 106 px | 0.39 mm | 4 cells | 40 cm |
+| with the rescue | **111 px** | **0.58 mm** | 1.7 cells | **52–56 cm** |
+
 Net effect on a 60-character link: **66 px → 99 px**, and simulated scan range
 from about 37 cm to about 48 cm.
+
+When a code does end up at 2 px per cell — above about 107 characters, where
+nothing can be done — the page says so under the preview, because that is the
+point where shortening the payload is the only remaining fix.
 
 ### Captions
 
@@ -328,6 +359,13 @@ Two things here address it:
 - **QR codes are placed with a small pseudo-random offset**, up to
   `QR_JITTER_PX` (8 px) from centre on each axis, so successive codes do not
   land on exactly the same pixels.
+
+Jitter is bounded by the *comfortable* border (`QR_QUIET_MIN`), never by
+whatever the plan settled for. On a rescued code the two collide — there is not
+room for 2 cells on both sides — and the axis is centred instead. Letting jitter
+spend the rescued border hands back the range the bigger cell just bought: an
+85-character code pushed to a 1.0-cell margin read to 34 cm against a dark
+surround, where centred at 1.7 cells it reads to 52 cm.
 
 The offset comes from the payload rather than a random number generator, so the
 same content always lands in the same spot. If it moved on every draw the
@@ -439,6 +477,7 @@ Tunables at the top of `main.cpp`:
 | `MAX_TEXT_LEN` | `400` | TEXT payload cap |
 | `QR_MAX_VERSION` | `10` | largest grid, 57 × 57 cells |
 | `QR_QUIET_MIN` | `2` | [white border, in cells](#how-a-qr-code-is-sized) |
+| `QR_QUIET_RESCUE` | `1` | [narrower border, only to escape the 2 px floor](#how-a-qr-code-is-sized) |
 | `QR_JITTER_PX` | `8` | [anti-retention offset](#does-e-paper-burn-in) |
 | `AP_SSID` / `AP_CHANNEL` / `HOSTNAME` | `eink-setup` / `11` / `eink` | networking |
 

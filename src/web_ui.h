@@ -24,6 +24,7 @@ h1 span{color:var(--mut);font-weight:400}
 #pvwrap.pending{box-shadow:0 0 0 2px var(--acc)}
 #pv{width:100%;height:auto;image-rendering:pixelated;image-rendering:crisp-edges}
 .muted{color:var(--mut);font-size:13px;margin:8px 2px 0}
+.muted.warn{color:#e0a44a}
 .seg{display:flex;gap:6px;background:#141720;border:1px solid var(--line);border-radius:10px;padding:4px;margin-bottom:12px}
 .seg input{position:absolute;opacity:0;pointer-events:none}
 .seg label{flex:1;min-width:0;text-align:center;padding:9px 0;border-radius:7px;font-weight:600;
@@ -288,7 +289,9 @@ function showQr(q){
   e.hidden=false;
   e.textContent="version "+q.version+" \u00b7 "+q.ecc+" correction \u00b7 "
     +q.modules+"\u00d7"+q.modules+" cells at "+q.scale+" px ("+q.mm+" mm) \u00b7 "
-    +q.side+" px square";
+    +q.side+" px square"
+    +(q.atLimit?" \u2014 at the readability limit; a shorter payload would scan from further":"");
+  e.className=q.atLimit?"muted warn":"muted";
 }
 
 function markPreviewed(){
