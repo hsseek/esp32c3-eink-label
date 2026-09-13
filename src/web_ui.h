@@ -343,16 +343,28 @@ function stale(){
   $("#now").textContent="preview is out of date \u2014 press Preview";
 }
 
+// Only a failed fetch means the label is unreachable. Everything after it is
+// our own code, and reporting a bug there as a network problem is how a
+// malformed /api/status hid behind "cannot reach the label" while the device
+// was answering every request in under 200 ms. So the network case is tagged at
+// the one place it can occur, and nothing downstream is second-guessed.
+function jsonFetch(url,opts){
+  return fetch(url,opts)
+    .catch(function(){ throw new Error("cannot reach the label") })
+    .then(function(r){
+      return r.text().then(function(t){
+        try{ return JSON.parse(t) }
+        catch(e){ throw new Error("unreadable reply from "+url+" (HTTP "+r.status+")") }
+      });
+    });
+}
+function fail(e){
+  if(window.console&&console.error) console.error(e);   // keep the stack findable
+  say((e&&e.message)||"something went wrong","err");
+}
+
 function load(){
-  // Two very different failures used to print the same message. A malformed
-  // response is not an unreachable label, and saying so cost real debugging.
-  fetch("/api/status").then(function(r){
-    if(!r.ok) throw new Error("HTTP "+r.status);
-    return r.text();
-  }).then(function(t){
-    var j; try{ j=JSON.parse(t) }catch(e){ throw new Error("bad status response: "+e.message) }
-    return j;
-  }).then(function(j){
+  jsonFetch("/api/status").then(function(j){
     var cap = j.mode==="none"
       ? "panel is blank"
       : j.mode.toUpperCase()+" \u00b7 "+j.updates+" update"+(j.updates==1?"":"s")+" since boot";
@@ -380,9 +392,7 @@ function load(){
     $("#net").textContent=j.ap?("AP "+j.ssid+" \u00b7 "+j.ip)
                               :(j.ssid+" \u00b7 "+j.ip+" \u00b7 "+j.rssi+" dBm");
     syncMode();syncCount();
-  }).catch(function(e){
-    say(/^(bad status|HTTP )/.test(e.message) ? e.message : "cannot reach the label","err");
-  });
+  }).catch(fail);
 }
 
 var BADGE={text:"TEXT",qr:"QR",rich:"UNICODE",image:"IMAGE",draw:"DRAW"};
@@ -430,7 +440,7 @@ function useRecent(r,idx){
   // A stored frame. Pull it back at full resolution and leave it staged, so the
   // button already says Print to panel and one more tap re-prints it exactly.
   busy(true); say("fetching\u2026");
-  fetch("/api/recent?i="+idx).then(function(x){return x.json()}).then(function(j){
+  jsonFetch("/api/recent?i="+idx).then(function(j){
     busy(false);
     if(!j.ok){ say(j.error,"err"); return }
     $(r.mode==="rich"?"#m3":r.mode==="draw"?"#m5":"#m4").checked=true;
@@ -440,14 +450,14 @@ function useRecent(r,idx){
     pendingBits=j.bits;
     paint(j.bits,j.w,j.h);
     markPreviewed();
-  }).catch(function(){ busy(false); say("request failed","err") });
+  }).catch(function(e){ busy(false); fail(e) });
 }
 
 function busy(b){$("#go").disabled=b;$("#btnpv").disabled=b;$("#clr").disabled=b}
 
 function post(url,body,okmsg){
   busy(true);say("working\u2026");
-  return fetch(url,{method:"POST",body:body}).then(function(r){return r.json()})
+  return jsonFetch(url,{method:"POST",body:body})
     .then(function(j){
       busy(false);
       if(!j.ok){say(j.error,"err");return}
@@ -456,7 +466,7 @@ function post(url,body,okmsg){
             : (okmsg||"display updated"),"ok");
       clearPreview();
       load();
-    }).catch(function(){busy(false);say("request failed","err")});
+    }).catch(function(e){busy(false);fail(e)});
 }
 
 function doPrint(){
@@ -501,21 +511,21 @@ $("#btnpv").addEventListener("click",function(){
     return;
   }
   busy(true);say("rendering\u2026");
-  fetch("/api/preview",{method:"POST",body:params()}).then(function(r){return r.json()})
+  jsonFetch("/api/preview",{method:"POST",body:params()})
     .then(function(j){
       busy(false);
       if(!j.ok){say(j.error,"err");return}
       paint(j.preview,j.w,j.h);
       showQr(j.qr);
       markPreviewed();
-    }).catch(function(){busy(false);say("request failed","err")});
+    }).catch(function(e){busy(false);fail(e)});
 });
 
 $("#recclr").addEventListener("click",function(){
   var b=new URLSearchParams(); b.set("clear","1");
-  fetch("/api/recents",{method:"POST",body:b}).then(function(r){return r.json()})
+  jsonFetch("/api/recents",{method:"POST",body:b})
     .then(function(j){renderRecents(j.recents);say("recent list cleared","ok")})
-    .catch(function(){say("request failed","err")});
+    .catch(fail);
 });
 $("#f").addEventListener("submit",function(e){e.preventDefault();doPrint()});
 $("#clr").addEventListener("click",function(){post("/api/clear",new URLSearchParams(),"panel cleared")});
@@ -585,16 +595,36 @@ a{color:var(--acc);font-size:14px}
 <script>
 var $=function(s){return document.querySelector(s)};
 function say(t,c){var m=$("#msg");m.textContent=t;m.className=c||""}
+// Only a failed fetch means the label is unreachable. Everything after it is
+// our own code, and reporting a bug there as a network problem is how a
+// malformed /api/status hid behind "cannot reach the label" while the device
+// was answering every request in under 200 ms. So the network case is tagged at
+// the one place it can occur, and nothing downstream is second-guessed.
+function jsonFetch(url,opts){
+  return fetch(url,opts)
+    .catch(function(){ throw new Error("cannot reach the label") })
+    .then(function(r){
+      return r.text().then(function(t){
+        try{ return JSON.parse(t) }
+        catch(e){ throw new Error("unreadable reply from "+url+" (HTTP "+r.status+")") }
+      });
+    });
+}
+function fail(e){
+  if(window.console&&console.error) console.error(e);   // keep the stack findable
+  say((e&&e.message)||"something went wrong","err");
+}
+
 function scan(){
   $("#pick").innerHTML="<option value=''>scanning…</option>";
-  fetch("/api/scan").then(function(r){return r.json()}).then(function(j){
+  jsonFetch("/api/scan").then(function(j){
     var o="<option value=''>— pick a network —</option>";
     j.nets.forEach(function(n){
       o+="<option value='"+n.ssid.replace(/'/g,"&#39;")+"'>"+
          n.ssid+"  ("+n.rssi+" dBm"+(n.open?", open":"")+")</option>";
     });
     $("#pick").innerHTML=o;
-  }).catch(function(){say("scan failed","err")});
+  }).catch(fail);
 }
 $("#pick").addEventListener("change",function(){if(this.value)$("#ssid").value=this.value});
 $("#rescan").addEventListener("click",scan);
@@ -603,10 +633,10 @@ $("#f").addEventListener("submit",function(e){
   var b=new URLSearchParams();
   b.set("ssid",$("#ssid").value);b.set("pass",$("#pass").value);
   say("saving…");
-  fetch("/api/wifi",{method:"POST",body:b}).then(function(r){return r.json()}).then(function(j){
+  jsonFetch("/api/wifi",{method:"POST",body:b}).then(function(j){
     if(j.ok)say("saved — rebooting, reconnect your phone to your home Wi-Fi","ok");
     else say(j.error,"err");
-  }).catch(function(){say("request failed","err")});
+  }).catch(fail);
 });
 scan();
 </script>
@@ -650,9 +680,11 @@ a{color:var(--acc)}
 <p class="muted"><a href="/">&larr; back to the label</a></p>
 </main>
 <script>
-fetch("/api/status").then(function(r){return r.json()}).then(function(j){
-  document.getElementById("cur").textContent=j.build||"unknown";
-}).catch(function(){document.getElementById("cur").textContent="unreachable"});
+fetch("/api/status").then(function(r){return r.text()}).then(function(t){
+  document.getElementById("cur").textContent=JSON.parse(t).build||"unknown";
+}).catch(function(e){    // same trap, smaller stakes: say which failure it was
+  document.getElementById("cur").textContent="unavailable \u2014 "+((e&&e.message)||"error");
+});
 
 var f=document.getElementById("f");
 f.addEventListener("submit",function(e){
