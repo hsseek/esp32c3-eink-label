@@ -91,10 +91,23 @@ static const uint8_t  FULL_REFRESH_EVERY = 10;   // partial updates between full
 static const uint32_t PANEL_KEEP_POWERED_MS    = 0;
 static const uint32_t PANEL_HIBERNATE_AFTER_MS = 300000;   // 5 min, deep sleep
 static const uint16_t MAX_TEXT_LEN       = 400;  // chars accepted in TEXT mode
-static const uint8_t  QR_MAX_VERSION     = 10;   // 57x57 modules; bigger is unreadable here
-static const uint8_t  QR_ECC             = ECC_MEDIUM;
-static const uint8_t  QR_QUIET           = 4;    // quiet zone, in modules
+static const uint8_t  QR_MAX_VERSION     = 10;   // 57x57 modules, the largest that fits
+// Quiet zone -- the white border a scanner needs -- in modules. ISO 18004 asks
+// for 4, but that is reserved BEFORE the module size is chosen and the division
+// rounds down, which is expensive: 33 modules + 4 + 4 = 41 into 122 px gives
+// 2.97 -> 2 px per module, and the border that then lands on the glass is 14
+// modules. Reserving 2 lets the same code take 3 px per module and still leaves
+// 3.7. Checked against a simulated phone camera: 4, 3 and 2 modules all decode
+// alike, and only at 1 does detection start to fail. A dark surround behind the
+// panel is no worse than its white bezel -- it gives the detector a firmer edge
+// -- so this does not depend on how the label is mounted.
+static const uint8_t  QR_QUIET_MIN       = 2;
 static const uint8_t  QR_MIN_SCALE       = 2;    // px per module; 1 is unscannable here
+// Maximum deviation from centre, per axis, when placing a QR code. Spreads
+// panel wear without making the layout look accidental -- see renderQrToCanvas.
+static const uint8_t  QR_JITTER_PX       = 8;
+static const uint8_t  QR_CAPTION_GAP     = 8;    // px between a code and its caption
+static const uint16_t MAX_CAPTION_LEN    = 60;
 static const char*    AP_SSID            = "eink-setup";
 // 2.4 GHz channel for the setup AP. Channel 1 is the arduino-esp32 default and
 // is usually the most contended; a beacon from a bare-PCB-antenna board can be
@@ -137,6 +150,7 @@ static bool     g_haveImage = false;
 
 static Mode     g_mode    = MODE_NONE;
 static String   g_text    = "";
+static String   g_caption = "";         // QR mode only: label drawn beside the code
 static uint8_t  g_size    = 2;          // 1 small, 2 medium, 3 large
 static uint32_t g_updates = 0;
 
@@ -303,49 +317,65 @@ static uint8_t wrapText(const String& s, uint16_t cols, uint8_t maxRows,
   return n;
 }
 
-static void renderTextToCanvas(GFXcanvas1& c, const String& raw, uint8_t size) {
-  String s = sanitizeForFont(raw);
-
-  const uint16_t cw    = 6 * size;               // built-in font cell
-  const uint16_t chh   = 8 * size;
-  const uint16_t pitch = chh + (size >= 2 ? 3 : 2);   // a little leading
-  uint16_t cols    = PANEL_W / cw;
-  uint8_t  maxRows = PANEL_H / pitch;
-  if (maxRows > MAX_LINES) maxRows = MAX_LINES;
-  if (cols < 4) cols = 4;
-
+// Word-wraps into a rectangle and centres the block vertically. `fixedSize` of
+// 0 means auto-fit: try 3, then 2, then 1, and take the first that does not
+// have to truncate. Returns the size actually used.
+static uint8_t drawTextInRect(GFXcanvas1& c, const String& raw,
+                              int16_t rx, int16_t ry, uint16_t rw, uint16_t rh,
+                              uint8_t fixedSize) {
+  const String s = sanitizeForFont(raw);
   String lines[MAX_LINES];
+  uint8_t n = 0, size = 1, pitch = 10;
+  uint16_t cols = 4;
   bool truncated = false;
-  uint8_t n = wrapText(s, cols, maxRows, lines, truncated);
 
-  if (truncated && n > 0) {                       // "…" as three dots: the
+  for (uint8_t trial = (fixedSize ? fixedSize : 3); trial >= 1; trial--) {
+    const uint16_t cw = 6 * trial;
+    const uint16_t p  = 8 * trial + (trial >= 2 ? 3 : 2);   // a little leading
+    uint16_t tcols = rw / cw;
+    uint8_t  trows = (uint8_t)(rh / p);
+    if (trows > MAX_LINES) trows = MAX_LINES;
+    if (tcols < 4) tcols = 4;
+    if (trows < 1) trows = 1;
+
+    bool tr = false;
+    const uint8_t k = wrapText(s, tcols, trows, lines, tr);
+    size = trial; pitch = (uint8_t)p; cols = tcols; n = k; truncated = tr;
+    if (!tr || fixedSize || trial == 1) break;
+  }
+
+  if (truncated && n > 0 && cols >= 4) {          // "…" as three dots: the
     String& last = lines[n - 1];                  // built-in font has no U+2026
     if (last.length() > (uint16_t)(cols - 3)) last = last.substring(0, cols - 3);
     last += "...";
   }
 
-  c.fillScreen(0);
   c.setFont(NULL);
   c.setTextSize(size);
   c.setTextColor(1);
   c.setTextWrap(false);
 
-  int16_t y0 = ((int16_t)PANEL_H - (int16_t)(n * pitch)) / 2;
-  if (y0 < 0) y0 = 0;
+  const uint16_t cw = 6 * size;
+  int16_t y0 = ry + ((int16_t)rh - (int16_t)(n * pitch)) / 2;
+  if (y0 < ry) y0 = ry;
   for (uint8_t i = 0; i < n; i++) {
-    int16_t x = ((int16_t)PANEL_W - (int16_t)(lines[i].length() * cw)) / 2;
-    if (x < 0) x = 0;
+    int16_t x = rx + ((int16_t)rw - (int16_t)(lines[i].length() * cw)) / 2;
+    if (x < rx) x = rx;
     c.setCursor(x, y0 + i * pitch);
     c.print(lines[i]);
   }
+  return size;
+}
+
+static void renderTextToCanvas(GFXcanvas1& c, const String& raw, uint8_t size) {
+  c.fillScreen(0);
+  drawTextInRect(c, raw, 0, 0, PANEL_W, PANEL_H, size);
 }
 
 // ============================================================================
 //  Rendering — QR
 // ============================================================================
 
-// Picks the smallest QR version that holds the payload, then the largest whole
-// module size that still leaves a 4-module quiet zone. Centered.
 // Byte-mode capacity in bytes, [ecc][version-1], versions 1..QR_MAX_VERSION.
 //
 // ricmoo/QRCode does NOT range-check the payload against the version it is
@@ -360,51 +390,120 @@ static const uint16_t QR_BYTE_CAPACITY[4][QR_MAX_VERSION] = {
   { 11, 20, 32, 46,  60,  74,  86, 108, 130, 151 },  // ECC_QUARTILE
   {  7, 14, 24, 34,  44,  58,  64,  84,  98, 119 },  // ECC_HIGH
 };
+static const char* const QR_ECC_NAME[4] = { "Low", "Medium", "Quartile", "High" };
 
-static bool renderQrToCanvas(GFXcanvas1& c, const String& payload, String& err) {
+struct QrPlan {
+  uint8_t  version;    // 1..QR_MAX_VERSION
+  uint8_t  ecc;        // ECC_LOW..ECC_HIGH
+  uint8_t  scale;      // px per module — what actually decides readability
+  uint16_t modules;    // 4 * version + 17
+  uint16_t side;       // modules * scale, in px
+};
+static QrPlan g_qrPlan      = {0, 0, 0, 0, 0};   // of the frame on the glass
+static bool   g_qrPlanValid = false;
+
+// Chooses the (version, error-correction) pair giving the LARGEST module,
+// breaking ties toward stronger error correction.
+//
+// Module size is what decides whether a phone can read the code at all; error
+// correction only starts to matter once part of the code is unreadable, which
+// on a clean panel behind glass is the rarer failure. Both are quantised — a
+// module must be a whole number of pixels — so scale is a step function of the
+// module count, and a LARGER grid at STRONGER correction frequently lands on
+// the same step. When it does the stronger correction is free, because the
+// space it occupies was being discarded to rounding anyway.
+//
+// Fixing ECC at MEDIUM (as this used to) throws that away: a 60-byte payload
+// took version 4 at 2 px per module, 66 px on a 122 px panel, when version 4 at
+// 3 px per module — 99 px — was available the whole time.
+static bool planQr(uint16_t len, uint16_t availW, uint16_t availH, QrPlan& out) {
+  bool found = false;
+  for (int8_t e = ECC_HIGH; e >= ECC_LOW; e--) {          // strongest first
+    uint8_t v = 0;
+    for (uint8_t i = 1; i <= QR_MAX_VERSION; i++) {
+      if (len <= QR_BYTE_CAPACITY[e][i - 1]) { v = i; break; }
+    }
+    if (!v) continue;                                     // too long for this level
+    const uint16_t modules = 4u * v + 17u;
+    const uint16_t total   = modules + 2u * QR_QUIET_MIN;
+    const uint16_t scale   = min(availW / total, availH / total);
+    if (scale < QR_MIN_SCALE) continue;
+    if (!found || scale > out.scale) {
+      out.version = v;
+      out.ecc     = (uint8_t)e;
+      out.scale   = (uint8_t)scale;
+      out.modules = modules;
+      out.side    = modules * scale;
+      found = true;
+    }
+  }
+  return found;
+}
+
+static uint32_t strHash(const String& s) {                // FNV-1a
+  uint32_t h = 2166136261u;
+  for (size_t i = 0; i < s.length(); i++) { h ^= (uint8_t)s[i]; h *= 16777619u; }
+  return h;
+}
+
+// Draws the code into the [areaX, areaX+areaW) column, full panel height. The
+// caller has already cleared the canvas; the quiet zone is just the margin left
+// around the code.
+static bool renderQrToCanvas(GFXcanvas1& c, const String& payload,
+                             int16_t areaX, uint16_t areaW,
+                             QrPlan& plan, String& err) {
   static uint8_t qrBuf[QR_BUF_BYTES];
   QRCode qr;
-  uint8_t version = 0;
   const uint16_t len = payload.length();
 
-  for (uint8_t v = 1; v <= QR_MAX_VERSION; v++) {
-    if (len <= QR_BYTE_CAPACITY[QR_ECC][v - 1]) { version = v; break; }
-  }
-  if (!version) {
-    err = String("QR payload too long: ") + len + " bytes, limit "
-        + QR_BYTE_CAPACITY[QR_ECC][QR_MAX_VERSION - 1];
+  if (!planQr(len, areaW, PANEL_H, plan)) {
+    const uint16_t cap = QR_BYTE_CAPACITY[ECC_LOW][QR_MAX_VERSION - 1];
+    err = (len > cap)
+        ? String("QR payload too long: ") + len + " bytes, limit " + cap
+        : String("QR payload too long to stay scannable here: ") + len
+          + " bytes needs more modules than " + areaW + "x" + PANEL_H
+          + " px can show at " + QR_MIN_SCALE + " px each";
     return false;
   }
-  if (qrcode_initText(&qr, qrBuf, version, QR_ECC, payload.c_str()) != 0) {
+  if (qrcode_initText(&qr, qrBuf, plan.version, plan.ecc, payload.c_str()) != 0) {
     err = "QR encoding failed";
     return false;
   }
 
-  const uint16_t modules = qr.size;
-  const uint16_t total   = modules + 2 * QR_QUIET;
-  uint16_t scale = min(PANEL_W / total, PANEL_H / total);
-  if (scale < QR_MIN_SCALE) {
-    // One pixel per module on a 0.19 mm pitch panel cannot be scanned; refuse
-    // rather than draw a code nothing can read.
-    err = String("QR payload too long to stay scannable: ") + len
-        + " bytes needs version " + version + " (" + modules + " modules), "
-        "which leaves only " + scale + " px per module";
-    return false;
-  }
+  // Anti-retention jitter. E-paper does not burn in the way OLED does — there
+  // is no emissive material to age — but a pattern held in one spot for a long
+  // time can leave a faint residual image as the pigment settles, and repeated
+  // switching wears one area of the film harder than the rest. Nudging the code
+  // a few pixels spreads both across the glass.
+  //
+  // The offset comes from the payload, not from a random number generator, so
+  // the same content always lands in the same place. Were it to move on every
+  // draw, the unchanged-image check could never fire and every repeat print
+  // would cost a full 2.4 s refresh. It is also bounded to QR_JITTER_PX rather
+  // than filling the available slack: a code wandering 70 px across the panel
+  // reads as a bug, not as care.
+  const int16_t quiet  = (int16_t)QR_QUIET_MIN * plan.scale;
+  const uint32_t h     = strHash(payload);
+  const int16_t jx     = (int16_t)(h % (2u * QR_JITTER_PX + 1u)) - QR_JITTER_PX;
+  const int16_t jy     = (int16_t)((h >> 16) % (2u * QR_JITTER_PX + 1u)) - QR_JITTER_PX;
 
-  const int16_t side = modules * scale;
-  const int16_t ox   = ((int16_t)PANEL_W - side) / 2;
-  const int16_t oy   = ((int16_t)PANEL_H - side) / 2;
+  int16_t ox = areaX + ((int16_t)areaW   - (int16_t)plan.side) / 2 + jx;
+  int16_t oy =         ((int16_t)PANEL_H - (int16_t)plan.side) / 2 + jy;
+  const int16_t xLo = areaX + quiet, xHi = areaX + (int16_t)areaW - plan.side - quiet;
+  const int16_t yLo = quiet,         yHi = (int16_t)PANEL_H - plan.side - quiet;
+  if (ox < xLo) ox = xLo;  if (ox > xHi) ox = xHi;
+  if (oy < yLo) oy = yLo;  if (oy > yHi) oy = yHi;
 
-  c.fillScreen(0);                            // white; quiet zone is just margin
-  for (uint16_t y = 0; y < modules; y++) {
-    for (uint16_t x = 0; x < modules; x++) {
+  for (uint16_t y = 0; y < plan.modules; y++) {
+    for (uint16_t x = 0; x < plan.modules; x++) {
       if (qrcode_getModule(&qr, x, y)) {
-        c.fillRect(ox + x * scale, oy + y * scale, scale, scale, 1);
+        c.fillRect(ox + x * plan.scale, oy + y * plan.scale, plan.scale, plan.scale, 1);
       }
     }
   }
-  Serial.printf("[qr] version %u, %ux%u modules, scale %u\n", version, modules, modules, scale);
+  Serial.printf("[qr] v%u %s %ux%u modules, %u px/module, %u px, at %d,%d\n",
+                plan.version, QR_ECC_NAME[plan.ecc], plan.modules, plan.modules,
+                plan.scale, plan.side, ox, oy);
   return true;
 }
 
@@ -513,6 +612,7 @@ static void saveContent() {
   prefs.putUChar("mode", (uint8_t)g_mode);
   prefs.putUChar("size", g_size);
   prefs.putString("text", g_text);
+  prefs.putString("cap", g_caption);
   if (g_mode == MODE_IMAGE && g_haveImage) {
     size_t n = prefs.putBytes("image", g_image, CANVAS_BYTES);
     if (n != CANVAS_BYTES) Serial.printf("[nvs] image save short: %u/%u bytes\n",
@@ -525,7 +625,8 @@ static void loadContent() {
   prefs.begin("eink", true);
   g_mode = (Mode)prefs.getUChar("mode", MODE_NONE);
   g_size = prefs.getUChar("size", 2);
-  g_text = prefs.getString("text", "");
+  g_text    = prefs.getString("text", "");
+  g_caption = prefs.getString("cap", "");
   if (g_mode == MODE_IMAGE) {
     g_haveImage = (prefs.getBytesLength("image") == CANVAS_BYTES) &&
                   (prefs.getBytes("image", g_image, CANVAS_BYTES) == CANVAS_BYTES);
@@ -537,8 +638,11 @@ static void loadContent() {
   if (g_mode != MODE_TEXT && g_mode != MODE_QR && g_mode != MODE_IMAGE) g_mode = MODE_NONE;
 }
 
-// Renders into the canvas only; err is filled on rejection.
-static bool renderToCanvas(GFXcanvas1& c, Mode mode, const String& text, uint8_t size, String& err) {
+// Renders into the canvas only; err is filled on rejection. `planOut`, when
+// given, receives how the QR code was sized so the caller can report it.
+static bool renderToCanvas(GFXcanvas1& c, Mode mode, const String& text,
+                           const String& caption, uint8_t size, String& err,
+                           QrPlan* planOut = nullptr) {
   if (mode == MODE_NONE) { c.fillScreen(0); return true; }
 
   if (mode == MODE_IMAGE) {
@@ -558,14 +662,39 @@ static bool renderToCanvas(GFXcanvas1& c, Mode mode, const String& text, uint8_t
     renderTextToCanvas(c, text, size);
     return true;
   }
-  return renderQrToCanvas(c, text, err);
+
+  // QR. A square code on a 250x122 panel can never be taller than 122 px, so
+  // more than half the glass is unusable by construction. With a caption the
+  // code takes a 122 px square on the left and the text gets the strip that was
+  // going to be blank anyway — which is what makes it a label rather than a
+  // bare code.
+  if (caption.length() > MAX_CAPTION_LEN) {
+    err = String("caption too long: ") + caption.length() + " chars, limit " + MAX_CAPTION_LEN;
+    return false;
+  }
+  const bool hasCap    = caption.length() > 0;
+  const uint16_t qrW   = hasCap ? PANEL_H : PANEL_W;
+  QrPlan plan = {0, 0, 0, 0, 0};
+  c.fillScreen(0);
+  if (!renderQrToCanvas(c, text, 0, qrW, plan, err)) return false;
+  if (hasCap) {
+    const int16_t capX = (int16_t)qrW + QR_CAPTION_GAP;
+    drawTextInRect(c, caption, capX, 0, PANEL_W - capX - 4, PANEL_H, 0);
+  }
+  if (planOut) *planOut = plan;
+  return true;
 }
 
-static bool applyContent(Mode mode, const String& text, uint8_t size, String& err) {
-  if (!renderToCanvas(canvas, mode, text, size, err)) return false;
-  g_mode = mode;
-  g_text = (mode == MODE_NONE) ? "" : text;
+static bool applyContent(Mode mode, const String& text, const String& caption,
+                         uint8_t size, String& err) {
+  QrPlan plan = {0, 0, 0, 0, 0};
+  if (!renderToCanvas(canvas, mode, text, caption, size, err, &plan)) return false;
+  g_mode    = mode;
+  g_text    = (mode == MODE_NONE) ? "" : text;
+  g_caption = (mode == MODE_QR)   ? caption : "";
   if (mode == MODE_TEXT) g_size = size;
+  g_qrPlanValid = (mode == MODE_QR);
+  if (g_qrPlanValid) g_qrPlan = plan;
   // A clear must leave the glass genuinely blank, so never do it differentially.
   pushCanvas(mode == MODE_NONE);
   saveContent();
@@ -762,14 +891,30 @@ static void netTick() {
 //  HTTP
 // ============================================================================
 
+// How the code was sized, so the page can show it instead of hiding it in the
+// serial log. Module size steps in whole pixels, and the steps are invisible
+// otherwise: shortening a URL may buy a bigger module or may buy nothing.
+static String qrInfoJson(const QrPlan& p) {
+  String j = "{\"version\":";  j += p.version;
+  j += ",\"ecc\":\"";         j += QR_ECC_NAME[p.ecc];
+  j += "\",\"modules\":";     j += p.modules;
+  j += ",\"scale\":";         j += p.scale;
+  j += ",\"side\":";          j += p.side;
+  j += ",\"mm\":\"";          j += String(p.scale * 48.55f / 250.0f, 2);
+  j += "\"}";
+  return j;
+}
+
 static void sendJson(int code, const String& body) {
   server.sendHeader("Cache-Control", "no-store");
   server.send(code, "application/json", body);
 }
 
 static void sendOk() {
-  sendJson(200, String("{\"ok\":true,\"changed\":") +
-                (g_lastPushChanged ? "true" : "false") + "}");
+  String j = String("{\"ok\":true,\"changed\":") + (g_lastPushChanged ? "true" : "false");
+  if (g_qrPlanValid) { j += ",\"qr\":"; j += qrInfoJson(g_qrPlan); }
+  j += "}";
+  sendJson(200, j);
 }
 static void sendErr(const String& e)    { sendJson(400, String("{\"ok\":false,\"error\":\"") + jsonEscape(e) + "\"}"); }
 
@@ -797,6 +942,7 @@ static void handleStatus() {
   j.reserve(CANVAS_BYTES * 2);
   j  = "{\"mode\":\"";   j += modeName(g_mode);
   j += "\",\"text\":\""; j += jsonEscape(g_text);
+  j += "\",\"caption\":\""; j += jsonEscape(g_caption);
   j += "\",\"size\":";   j += g_size;
   j += ",\"w\":";        j += PANEL_W;
   j += ",\"h\":";        j += PANEL_H;
@@ -811,6 +957,7 @@ static void handleStatus() {
     j += "\",\"ip\":\""; j += WiFi.softAPIP().toString();
     j += "\",\"rssi\":0";
   }
+  if (g_qrPlanValid) { j += ",\"qr\":"; j += qrInfoJson(g_qrPlan); }
   j += ",\"preview\":\""; j += base64(canvas.getBuffer(), CANVAS_BYTES);
   j += "\"}";
   sendJson(200, j);
@@ -821,6 +968,7 @@ static void handleStatus() {
 static void handlePreview() {
   String mode = server.arg("mode");
   String text = server.arg("text");
+  String cap  = server.arg("caption");
   uint8_t size = (uint8_t)server.arg("size").toInt();
   if (size < 1 || size > 3) size = g_size;
 
@@ -830,12 +978,14 @@ static void handlePreview() {
   else { sendErr("mode must be \"text\" or \"qr\""); return; }
 
   String err;
-  if (!renderToCanvas(scratch, m, text, size, err)) { sendErr(err); return; }
+  QrPlan plan = {0, 0, 0, 0, 0};
+  if (!renderToCanvas(scratch, m, text, cap, size, err, &plan)) { sendErr(err); return; }
 
   String j;
   j.reserve(CANVAS_BYTES * 2);
   j  = "{\"ok\":true,\"w\":"; j += PANEL_W;
   j += ",\"h\":";              j += PANEL_H;
+  if (m == MODE_QR) { j += ",\"qr\":"; j += qrInfoJson(plan); }
   j += ",\"preview\":\"";     j += base64(scratch.getBuffer(), CANVAS_BYTES);
   j += "\"}";
   sendJson(200, j);
@@ -844,6 +994,7 @@ static void handlePreview() {
 static void handleDisplay() {
   String mode = server.arg("mode");
   String text = server.arg("text");
+  String cap  = server.arg("caption");
   uint8_t size = (uint8_t)server.arg("size").toInt();
   if (size < 1 || size > 3) size = g_size;
 
@@ -853,8 +1004,8 @@ static void handleDisplay() {
   else { sendErr("mode must be \"text\" or \"qr\""); return; }
 
   String err;
-  if (applyContent(m, text, size, err)) sendOk();
-  else                                  sendErr(err);
+  if (applyContent(m, text, cap, size, err)) sendOk();
+  else                                       sendErr(err);
 }
 
 // Accepts a browser-rasterised frame: base64 of exactly CANVAS_BYTES packed
@@ -871,14 +1022,14 @@ static void handleImage() {
   g_haveImage = true;
 
   String err;
-  if (applyContent(MODE_IMAGE, server.arg("text"), g_size, err)) sendOk();
-  else                                                           sendErr(err);
+  if (applyContent(MODE_IMAGE, server.arg("text"), "", g_size, err)) sendOk();
+  else                                                               sendErr(err);
 }
 
 static void handleClear() {
   String err;
-  if (applyContent(MODE_NONE, "", g_size, err)) sendOk();
-  else                                          sendErr(err);
+  if (applyContent(MODE_NONE, "", "", g_size, err)) sendOk();
+  else                                              sendErr(err);
 }
 
 static void handleScan() {
@@ -1046,13 +1197,20 @@ static void handleSerialLine(String line) {
     g_rebootAt = millis() + 300;
     return;
   } else if (line.equalsIgnoreCase("CLEAR")) {
-    ok = applyContent(MODE_NONE, "", g_size, err);
+    ok = applyContent(MODE_NONE, "", "", g_size, err);
   } else if (line.startsWith("TEXT:")) {
-    ok = applyContent(MODE_TEXT, line.substring(5), g_size, err);
+    ok = applyContent(MODE_TEXT, line.substring(5), "", g_size, err);
+  } else if (line.startsWith("QRC:")) {
+    // QRC:<caption>|<payload> — caption first, split on the FIRST bar, so the
+    // payload (a URL, typically) may itself contain one.
+    const String rest = line.substring(4);
+    const int bar = rest.indexOf('|');
+    if (bar < 0) { Serial.println(F("ERR QRC needs QRC:<caption>|<payload>")); return; }
+    ok = applyContent(MODE_QR, rest.substring(bar + 1), rest.substring(0, bar), g_size, err);
   } else if (line.startsWith("QR:")) {
-    ok = applyContent(MODE_QR, line.substring(3), g_size, err);
+    ok = applyContent(MODE_QR, line.substring(3), "", g_size, err);
   } else {
-    Serial.println(F("ERR unknown — TEXT:<s> | QR:<s> | CLEAR | WIFI:<ssid>,<pass> | FORGET | STATUS | SCAN | RECONNECT"));
+    Serial.println(F("ERR unknown — TEXT:<s> | QR:<s> | QRC:<cap>|<s> | CLEAR | WIFI:<ssid>,<pass> | FORGET | STATUS | SCAN | RECONNECT"));
     return;
   }
   Serial.println(ok ? "OK" : ("ERR " + err));
@@ -1091,6 +1249,7 @@ void setup() {
     prefs.putUChar("mode", MODE_NONE);
     prefs.putUChar("size", 2);
     prefs.putString("text", "");
+    prefs.putString("cap", "");
   }
   prefs.end();
   prefs.begin("wifi", false);
@@ -1104,8 +1263,14 @@ void setup() {
   loadContent();
   if (g_mode != MODE_NONE) {
     String err;
-    if (renderToCanvas(canvas, g_mode, g_text, g_size, err)) pushCanvas();
-    else Serial.printf("[epd] stored content rejected: %s\n", err.c_str());
+    QrPlan plan = {0, 0, 0, 0, 0};
+    if (renderToCanvas(canvas, g_mode, g_text, g_caption, g_size, err, &plan)) {
+      g_qrPlanValid = (g_mode == MODE_QR);
+      if (g_qrPlanValid) g_qrPlan = plan;
+      pushCanvas();
+    } else {
+      Serial.printf("[epd] stored content rejected: %s\n", err.c_str());
+    }
   }
 
   netBegin();
@@ -1113,7 +1278,7 @@ void setup() {
 
   if (g_mode == MODE_NONE) drawBootHint();
 
-  Serial.println(F("[rdy] TEXT:<s> | QR:<s> | CLEAR | WIFI:<ssid>,<pass> | STATUS | SCAN"));
+  Serial.println(F("[rdy] TEXT:<s> | QR:<s> | QRC:<cap>|<s> | CLEAR | WIFI:<ssid>,<pass> | STATUS | SCAN"));
 }
 
 void loop() {

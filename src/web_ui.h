@@ -29,6 +29,8 @@ h1 span{color:var(--mut);font-weight:400}
 .seg label{flex:1;min-width:0;text-align:center;padding:9px 0;border-radius:7px;font-weight:600;
   font-size:13px;letter-spacing:.01em;white-space:nowrap;color:var(--mut);cursor:pointer;user-select:none}
 .seg input:checked+label{background:var(--acc);color:#fff}
+input[type=text]{width:100%;background:#141720;color:var(--fg);border:1px solid var(--line);
+  border-radius:10px;padding:11px;font:15px/1.4 inherit;margin-top:6px}
 textarea{width:100%;min-height:88px;resize:vertical;background:#141720;color:var(--fg);
   border:1px solid var(--line);border-radius:10px;padding:11px;font:15px/1.4 inherit}
 textarea:focus,select:focus{outline:2px solid var(--acc);outline-offset:-1px}
@@ -54,6 +56,7 @@ a{color:var(--acc)}
 <div class="card">
   <div id="pvwrap"><canvas id="pv" width="250" height="122"></canvas></div>
   <p class="muted" id="now">loading&hellip;</p>
+  <p class="muted" id="qrinfo" hidden></p>
 </div>
 
 <form class="card" id="f">
@@ -75,6 +78,10 @@ a{color:var(--acc)}
       </label>
       <span class="muted" id="cnt">0</span>
     </div>
+  </div>
+  <div class="hide" id="caprow">
+    <label class="fld" for="cap">Caption &mdash; drawn beside the code, in the half of the panel a square QR cannot reach</label>
+    <input type="text" id="cap" maxlength="60" placeholder="optional, e.g. Guest Wi-Fi">
   </div>
   <div class="hide" id="imgrow">
     <label class="fld" for="file">Picture &mdash; scaled to fit and dithered to 1 bit</label>
@@ -118,6 +125,7 @@ function syncMode(){
   var m=curMode();
   $("#txtrow").className=(m==="image")?"hide":"";
   $("#szrow").className=(m==="qr")?"fld hide":"fld";
+  $("#caprow").className=(m==="qr")?"":"hide";
   $("#imgrow").className=(m==="image")?"":"hide";
   $("#txt").placeholder = m==="qr" ? "URL or text to encode"
     : m==="rich" ? "Emoji, Hangul, any script your phone can draw"
@@ -201,6 +209,7 @@ function params(){
   var b=new URLSearchParams();
   b.set("mode",curMode());
   b.set("text",$("#txt").value);
+  b.set("caption",$("#cap").value);
   b.set("size",$("#sz").value);
   return b;
 }
@@ -228,11 +237,13 @@ function load(){
     panel={b64:j.preview,w:j.w,h:j.h,caption:cap};
     $("#dim").textContent=j.w+"\u00d7"+j.h;
     if(!previewed){ paint(j.preview,j.w,j.h); $("#now").textContent=cap; }
+    if(!previewed) showQr(j.qr);
     if(j.mode!=="none"){
       // The device stores both bitmap tabs as one mode; the source string tells
       // them apart, since IMAGE never sends one.
       $(j.mode==="qr"?"#m2":j.mode==="image"?(j.text?"#m3":"#m4"):"#m1").checked=true;
       $("#txt").value=j.text;
+      $("#cap").value=j.caption||"";
       $("#sz").value=j.size;
     }
     $("#net").textContent=j.ap?("AP "+j.ssid+" \u00b7 "+j.ip)
@@ -268,6 +279,18 @@ function doPrint(){
   post("/api/image",b,"printed to the panel");
 }
 
+// Module size moves in whole pixels, so shortening a URL may buy a bigger
+// module or may buy nothing at all. Without this line the only way to find out
+// is a USB cable and the serial log.
+function showQr(q){
+  var e=$("#qrinfo");
+  if(!q){e.hidden=true;return}
+  e.hidden=false;
+  e.textContent="version "+q.version+" \u00b7 "+q.ecc+" correction \u00b7 "
+    +q.modules+"\u00d7"+q.modules+" cells at "+q.scale+" px ("+q.mm+" mm) \u00b7 "
+    +q.side+" px square";
+}
+
 function markPreviewed(){
   previewed=true;
   $("#btnpv").textContent="Print to panel";
@@ -289,6 +312,7 @@ $("#btnpv").addEventListener("click",function(){
       busy(false);
       if(!j.ok){say(j.error,"err");return}
       paint(j.preview,j.w,j.h);
+      showQr(j.qr);
       markPreviewed();
     }).catch(function(){busy(false);say("request failed","err")});
 });
@@ -298,6 +322,7 @@ $("#clr").addEventListener("click",function(){post("/api/clear",new URLSearchPar
 $("#m1").addEventListener("change",function(){syncMode();stale()});
 $("#m2").addEventListener("change",function(){syncMode();stale()});
 $("#sz").addEventListener("change",stale);
+$("#cap").addEventListener("input",stale);
 $("#txt").addEventListener("input",function(){syncCount();stale()});
 $("#m3").addEventListener("change",function(){syncMode();stale()});
 $("#m4").addEventListener("change",function(){syncMode();stale()});

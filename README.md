@@ -29,8 +29,11 @@ Firmware for an **ESP32-C3 SuperMini** driving a **Waveshare 2.13" e-Paper V4**
 - **Content survives reboots** — stored in NVS, redrawn once on boot.
 - **Zero-config networking** — captive-portal setup AP, mDNS, exponential
   backoff, and a rescue AP if the saved network stops working.
-- **USB serial fallback** — `TEXT:`, `QR:`, `CLEAR`, plus Wi-Fi provisioning
-  without ever touching the portal.
+- **QR codes sized for the panel, not for a spec sheet** — the cell size and
+  error-correction level are chosen together, and an optional caption fills the
+  half of the display a square code can never reach.
+- **USB serial fallback** — `TEXT:`, `QR:`, `QRC:`, `CLEAR`, plus Wi-Fi
+  provisioning without ever touching the portal.
 - **Panel-safe** — never left under drive voltage in an idle state.
 
 **Contents**
@@ -40,6 +43,8 @@ Firmware for an **ESP32-C3 SuperMini** driving a **Waveshare 2.13" e-Paper V4**
 [Build and flash](#build-and-flash) ·
 [Wi-Fi setup](#first-time-wi-fi-setup) ·
 [Using it](#using-it) ·
+[QR sizing](#how-a-qr-code-is-sized) ·
+[Burn-in](#does-e-paper-burn-in) ·
 [HTTP API](#http-api) ·
 [Layout](#project-layout) ·
 [Field notes](#field-notes) ·
@@ -209,6 +214,7 @@ in the first place, so the preview is simply that bitmap, shown instantly.
 ```
 TEXT:Hello from the desk
 QR:https://example.com/thing
+QRC:Guest Wi-Fi|https://example.com/thing     code plus a caption
 CLEAR
 WIFI:<ssid>,<password>     save credentials and reboot
 FORGET                     clear credentials, reboot into the setup AP
@@ -219,8 +225,9 @@ APCH:<1-13>                move the SoftAP channel, live
 TXPW:<2-20>                set transmit power in dBm, live
 ```
 
-`TEXT:` uses the font size last chosen in the web UI. The device answers `OK`
-or `ERR <reason>`.
+`TEXT:` uses the font size last chosen in the web UI. `QRC:` splits on the
+**first** bar only, so the payload may contain one; the caption may not. The
+device answers `OK` or `ERR <reason>`.
 
 ### Limits and rejections
 
@@ -229,8 +236,106 @@ Oversized payloads are refused with a message rather than drawn as garbage:
 | Mode | Limit |
 |------|-------|
 | TEXT | 400 characters (`MAX_TEXT_LEN`). Text that wraps past the panel height is truncated with `...` |
-| QR   | whatever fits QR version 10 at ECC-M (~270 bytes). Longer payloads are rejected — bigger versions would be too dense to scan at 122 px |
+| QR   | **271 bytes.** Shorter payloads get larger cells — see [how a QR code is sized](#how-a-qr-code-is-sized) |
 | UNICODE / IMAGE | exactly 3904 bytes once decoded (250 × 122, 1 bit per pixel). Anything else is rejected |
+
+### How a QR code is sized
+
+Two things decide whether a phone can read the code, and they pull against each
+other.
+
+**Cell size.** The grid is drawn a whole number of pixels per cell — there is no
+such thing as a 2.97-pixel cell — so the size moves in steps and everything left
+over is wasted. This is the dominant factor.
+
+**Error correction.** A QR code stores its message with redundancy woven
+through, so a scanner can rebuild it when part is unreadable. Four strengths
+exist — Low, Medium, Quartile, High, surviving roughly 7 / 15 / 25 / 30 % of the
+code being lost. The redundancy needs cells to live in, so stronger correction
+means more cells, and on a fixed 122 px panel, smaller ones.
+
+The firmware evaluates all four strengths, takes whichever yields the **largest
+cell**, and breaks ties toward the **stronger correction**. Because of the
+whole-pixel rounding, stronger correction is frequently free: the space it needs
+was being discarded anyway.
+
+| payload | grid | correction | cell | code |
+|---------|------|-----------|------|------|
+| ≤ 14 chars | 25 × 25 | High | 4 px (0.78 mm) | 100 px |
+| 30 chars | 25 × 25 | Low | 4 px | 100 px |
+| 60 chars | 33 × 33 | Medium | 3 px (0.58 mm) | 99 px |
+| 80 chars | 49 × 49 | High | 2 px (0.39 mm) | 98 px |
+| 230 chars | 53 × 53 | Low | 2 px | 106 px |
+| 271 chars | 57 × 57 | Low | 2 px | 114 px |
+
+One pixel per cell is 0.19 mm and no phone can read it, so `QR_MIN_SCALE` refuses
+it rather than drawing something useless.
+
+**The white border.** A scanner needs white around the code. ISO 18004 asks for
+4 cells, and reserving that up front is what used to make codes small: 33 cells
+plus 4 plus 4 is 41, and 122 ÷ 41 = 2.97 → **2 px per cell**, leaving a border
+that actually measured **14 cells**. It reserved 4, wasted 14, and halved the
+code to do it.
+
+`QR_QUIET_MIN` is therefore **2**. The same code then takes 3 px per cell and
+still ends up with a 3.7-cell border. Tested against a simulated phone camera,
+4, 3 and 2 cells decode alike and only 1 begins to fail; a dark surround behind
+the panel is no worse than its white bezel, since it gives the detector a firmer
+edge. So this does not depend on how the label is mounted.
+
+Net effect on a 60-character link: **66 px → 99 px**, and simulated scan range
+from about 37 cm to about 48 cm.
+
+### Captions
+
+A square code can never be taller than the 122 px panel height, so on a 250 px
+wide display **more than half the glass is unusable in QR mode by construction**.
+Fill it:
+
+```
+QRC:Guest Wi-Fi|WIFI:T:WPA;S:MyNetwork;P:hunter2;;
+```
+
+The code takes a 122 px square on the left, the caption gets the strip that was
+going to be blank. Caption text is auto-fitted — size 3, then 2, then 1, taking
+the first that does not need truncating — and is limited to 60 characters. The
+web UI shows a caption field whenever the QR tab is selected.
+
+Because the code is confined to the left square, its sizing is unchanged: height
+was always the binding dimension.
+
+### Does e-paper burn in?
+
+Not the way OLED does. OLED burn-in is emissive material ageing at different
+rates per pixel, and it is permanent. E-paper has no emissive layer — nothing is
+being driven continuously, and a static image costs no power at all.
+
+It does have a milder relative. A pattern left in one place for a long time can
+leave a faint residual image as the pigment settles, and an area switched
+repeatedly wears slightly differently from one that never changes. Unlike OLED
+burn-in this is usually recoverable: several full black-to-white refreshes clear
+it. Panel makers ask for a refresh at least once every 24 hours and warn against
+leaving a static image indefinitely, especially when warm.
+
+Two things here address it:
+
+- **Every update is a full refresh** by default (`PANEL_KEEP_POWERED_MS = 0`),
+  which is the same black-to-white cycle used to clear retention.
+- **QR codes are placed with a small pseudo-random offset**, up to
+  `QR_JITTER_PX` (8 px) from centre on each axis, so successive codes do not
+  land on exactly the same pixels.
+
+The offset comes from the payload rather than a random number generator, so the
+same content always lands in the same spot. If it moved on every draw the
+[unchanged-image check](#update-display-finished-instantly-and-nothing-flashed)
+could never fire and every repeat print would cost a full 2.4 s refresh. It is
+also bounded rather than filling the available slack — a code wandering 70 px
+across the panel reads as a bug, not as care.
+
+**The honest limit:** jitter spreads wear across *content changes*. A label that
+displays one code untouched for six months gets no benefit from it, because
+nothing redraws. If that is your use, a periodic self-refresh on a timer is the
+mitigation that would actually help — it is not implemented.
 
 ### Emoji, Hangul and pictures
 
@@ -286,8 +391,8 @@ Everything the web UI does is a plain form POST, so `curl` works just as well.
 | `GET`  | `/wifi` | | the setup page |
 | `GET`  | `/api/status` | | mode, text, size, panel size, update count, SSID/IP/RSSI, and the committed frame as base64 |
 | `GET`  | `/api/scan` | | up to 20 nearby networks |
-| `POST` | `/api/preview` | `mode=text\|qr`, `text`, `size=1..3` | the rendered frame — **panel untouched** |
-| `POST` | `/api/display` | `mode=text\|qr`, `text`, `size=1..3` | `{"ok":true,"changed":bool}` |
+| `POST` | `/api/preview` | `mode=text\|qr`, `text`, `caption`, `size=1..3` | the rendered frame — **panel untouched** |
+| `POST` | `/api/display` | `mode=text\|qr`, `text`, `caption`, `size=1..3` | `{"ok":true,"changed":bool}` |
 | `POST` | `/api/image` | `bits` (base64, 3904 bytes), `text` (optional source string) | as above |
 | `POST` | `/api/clear` | | as above |
 | `POST` | `/api/wifi` | `ssid`, `pass` | saves and reboots |
@@ -301,6 +406,12 @@ curl -s -X POST http://eink.local/api/display --data-urlencode 'mode=text' \
 Errors come back as HTTP 400 with `{"ok":false,"error":"..."}`. `changed:false`
 means the frame was identical to what the glass already holds and no refresh was
 performed.
+
+Anything that draws a QR code also reports how it was sized:
+
+```json
+"qr": {"version":4,"ecc":"Medium","modules":33,"scale":3,"side":99,"mm":"0.58"}
+```
 
 ---
 
@@ -321,7 +432,9 @@ Tunables at the top of `main.cpp`:
 | `PANEL_KEEP_POWERED_MS` | `0` | [full vs partial refresh](#ghosting-grey-text-or-update-display-doing-nothing) |
 | `FULL_REFRESH_EVERY` | `10` | partial updates between forced full ones |
 | `MAX_TEXT_LEN` | `400` | TEXT payload cap |
-| `QR_MAX_VERSION` / `QR_ECC` / `QR_QUIET` | `10` / M / `4` | QR sizing |
+| `QR_MAX_VERSION` | `10` | largest grid, 57 × 57 cells |
+| `QR_QUIET_MIN` | `2` | [white border, in cells](#how-a-qr-code-is-sized) |
+| `QR_JITTER_PX` | `8` | [anti-retention offset](#does-e-paper-burn-in) |
 | `AP_SSID` / `AP_CHANNEL` / `HOSTNAME` | `eink-setup` / `11` / `eink` | networking |
 
 ---
@@ -408,19 +521,28 @@ A full refresh is also forced on the first draw after boot, on `CLEAR`, and ever
 
 ### QR codes that will not scan
 
-`ricmoo/QRCode` does **not** check that a payload fits the version it is given.
-`qrcode_initBytes()` returns an error only when it cannot choose an encoding
-mode, never on overflow, so asking it for version 1 with 30 bytes of data
-produces a structurally valid-looking but unscannable code with no error at all.
+First check what the code actually is. The web UI prints its sizing under the
+preview, and the serial log says the same thing:
+
+```
+[qr] v4 Medium 33x33 modules, 3 px/module, 99 px, at 69,6
+```
+
+**At 2 px per module (0.39 mm) the code is at its readable limit.** That happens
+above roughly 78 characters, and the fix is a shorter payload, not a setting —
+a link shortener buys a whole step. Below about 43 characters you get 3 px, and
+below 15 you get 4 px.
+
+**A library trap worth knowing if you adapt this code.** `ricmoo/QRCode` does
+not check that a payload fits the version it is given. `qrcode_initBytes()`
+returns an error only when it cannot choose an encoding mode, never on overflow,
+so asking it for version 1 with 30 bytes produces a structurally valid-looking
+but unscannable code with no error at all.
 
 Do not write "try version 1, then 2, then 3 until it stops failing" — it never
 fails. This firmware carries its own `QR_BYTE_CAPACITY` table and picks the
 version from the payload length before calling the library. If you raise
 `QR_MAX_VERSION`, extend that table to match.
-
-Codes are also refused below `QR_MIN_SCALE` (2 px per module). At this panel's
-~0.19 mm pitch a one-pixel module cannot be read by a phone, so an over-long
-payload returns an error rather than drawing something useless.
 
 ### The display stays blank
 
