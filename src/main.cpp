@@ -10,6 +10,7 @@
 #include <Arduino.h>
 #include <SPI.h>
 #include <Update.h>
+#include <LittleFS.h>
 #include <WiFi.h>
 #include <WebServer.h>
 #include <DNSServer.h>
@@ -144,6 +145,10 @@ static const uint8_t  RECENTS_MAX        = 6;
 static const uint16_t RECENTS_MAX_LEN    = 1800;   // total, in NVS
 static const char     REC_SEP            = '\x1e';  // between records
 static const char     FLD_SEP            = '\x1f';  // between fields
+// Thumbnails for the recent list. A drawing has no text to show, so the list
+// needs a picture to be usable at all. 4x reduction, and a cell is black if ANY
+// source pixel under it is — averaging would thin a one-pixel stroke to nothing.
+static const uint8_t  THUMB_DIV          = 4;
 static const char*    AP_SSID            = "eink-setup";
 // 2.4 GHz channel for the setup AP. Channel 1 is the arduino-esp32 default and
 // is usually the most contended; a beacon from a bare-PCB-antenna board can be
@@ -174,6 +179,10 @@ static GFXcanvas1 canvas(PANEL_W, PANEL_H);
 static GFXcanvas1 scratch(PANEL_W, PANEL_H);
 static const uint16_t CANVAS_STRIDE = (PANEL_W + 7) / 8;
 static const uint32_t CANVAS_BYTES  = (uint32_t)CANVAS_STRIDE * PANEL_H;
+static const uint16_t THUMB_W       = (PANEL_W + THUMB_DIV - 1) / THUMB_DIV;   // 63
+static const uint16_t THUMB_H       = (PANEL_H + THUMB_DIV - 1) / THUMB_DIV;   // 31
+static const uint16_t THUMB_STRIDE  = (THUMB_W + 7) / 8;
+static const uint16_t THUMB_BYTES   = THUMB_STRIDE * THUMB_H;                  // 248
 
 // ── Content state ───────────────────────────────────────────────────────────
 enum Mode : uint8_t { MODE_NONE = 0, MODE_TEXT = 1, MODE_QR = 2, MODE_IMAGE = 3 };
@@ -192,7 +201,12 @@ static String   g_caption = "";         // QR mode only: label drawn beside the 
 // shows; this one replaces the running code, so it is the one thing on this
 // server worth a lock. Empty means the endpoint is off entirely — a default
 // password would be worse than none, since nobody would change it.
-static String   g_recents = "";         // REC_SEP-separated "mode/text/caption/size"
+static String   g_recents = "";         // REC_SEP-separated, see pushRecent()
+// The frames behind bitmap recents live in the flash filesystem, not in NVS: one
+// is 3904 bytes against a 20 KB NVS partition, while the filesystem partition is
+// 1.4 MB and was sitting empty. Six frames is 23 KB of it.
+static bool     g_fsReady = false;
+static uint8_t  g_frameBuf[CANVAS_BYTES];   // scratch for reading one back
 static String   g_otaPw   = "";
 static bool     g_otaAuthed = false;
 static bool     g_otaFailed = false;
@@ -781,16 +795,101 @@ static void stripSeps(String& s) {
   s.replace(String(FLD_SEP), "");
 }
 
+// A record is  mode / text / caption / size / frame-id, FLD_SEP between fields.
+// The frame id is an FNV-1a hash of the frame itself, which does double duty:
+// it names the file, and it makes an identical redraw produce an identical
+// record, so the existing de-duplication catches it with no extra work.
+static String framePath(uint32_t id) {
+  char b[20];
+  snprintf(b, sizeof b, "/r%08x.bin", (unsigned)id);
+  return String(b);
+}
+
+static uint32_t frameHash(const uint8_t* f) {
+  uint32_t h = 2166136261u;
+  for (uint32_t i = 0; i < CANVAS_BYTES; i++) { h ^= f[i]; h *= 16777619u; }
+  return h ? h : 1u;                    // 0 means "no frame"
+}
+
+static uint32_t recField(const String& rec, uint8_t idx) {   // numeric fields only
+  int start = 0;
+  for (uint8_t i = 0; i < idx; i++) {
+    start = rec.indexOf(FLD_SEP, start);
+    if (start < 0) return 0;
+    start++;
+  }
+  int end = rec.indexOf(FLD_SEP, start);
+  if (end < 0) end = rec.length();
+  return (uint32_t)strtoul(rec.substring(start, end).c_str(), nullptr, 10);
+}
+
+// Deletes any frame file no record points at. Covers eviction, de-duplication
+// and a reset midway through a write, in one sweep, rather than trying to keep
+// the two in step at every edit.
+static void gcFrames() {
+  if (!g_fsReady) return;
+  String keep = ",";
+  int start = 0;
+  while (start < (int)g_recents.length()) {
+    int end = g_recents.indexOf(REC_SEP, start);
+    if (end < 0) end = g_recents.length();
+    const uint32_t id = recField(g_recents.substring(start, end), 4);
+    if (id) { keep += framePath(id); keep += ','; }
+    start = end + 1;
+  }
+  File dir = LittleFS.open("/");
+  if (!dir) return;
+  String doomed;                        // collected first: deleting mid-walk is unsafe
+  for (File e = dir.openNextFile(); e; e = dir.openNextFile()) {
+    String n = e.name();
+    e.close();
+    if (!n.startsWith("/")) n = "/" + n;
+    if (!n.startsWith("/r") || !n.endsWith(".bin")) continue;
+    if (keep.indexOf("," + n + ",") < 0) { doomed += n; doomed += REC_SEP; }
+  }
+  dir.close();
+  start = 0;
+  while (start < (int)doomed.length()) {
+    int end = doomed.indexOf(REC_SEP, start);
+    if (end < 0) end = doomed.length();
+    const String n = doomed.substring(start, end);
+    if (n.length()) { LittleFS.remove(n); Serial.printf("[fs] dropped %s\n", n.c_str()); }
+    start = end + 1;
+  }
+}
+
 // Newest first, de-duplicated, oldest dropped on either count or total length.
-static void pushRecent(Mode m, const String& text, const String& cap, uint8_t size) {
-  if (m != MODE_TEXT && m != MODE_QR) return;
+// `frame` non-null stores the bitmap alongside; without a working filesystem the
+// entry is skipped rather than remembered as an empty row.
+static void pushRecent(const char* mode, const String& text, const String& cap,
+                       uint8_t size, const uint8_t* frame) {
   String t = text, c = cap;
   stripSeps(t); stripSeps(c);
-  String rec = String(m == MODE_QR ? "qr" : "text");
+
+  uint32_t fid = 0;
+  if (frame) {
+    if (!g_fsReady) return;
+    fid = frameHash(frame);
+    const String path = framePath(fid);
+    if (!LittleFS.exists(path)) {                 // same picture, same file
+      File f = LittleFS.open(path, "w");
+      if (!f) { Serial.println(F("[fs] frame open failed")); return; }
+      const size_t n = f.write(frame, CANVAS_BYTES);
+      f.close();
+      if (n != CANVAS_BYTES) {
+        Serial.printf("[fs] short write %u/%u\n", (unsigned)n, (unsigned)CANVAS_BYTES);
+        LittleFS.remove(path);
+        return;
+      }
+    }
+  }
+
+  String rec = String(mode);
   rec += FLD_SEP; rec += t;
   rec += FLD_SEP; rec += c;
   rec += FLD_SEP; rec += size;
-  if (rec.length() > RECENTS_MAX_LEN) return;      // absurdly long, skip it
+  rec += FLD_SEP; rec += fid;
+  if (rec.length() > RECENTS_MAX_LEN) return;
 
   String out = rec;
   uint8_t kept = 1;
@@ -800,14 +899,44 @@ static void pushRecent(Mode m, const String& text, const String& cap, uint8_t si
     if (end < 0) end = g_recents.length();
     const String prev = g_recents.substring(start, end);
     start = end + 1;
-    if (prev.length() == 0 || prev == rec) continue;          // de-dupe
+    if (prev.length() == 0 || prev == rec) continue;
     if (out.length() + 1 + prev.length() > RECENTS_MAX_LEN) break;
     out += REC_SEP; out += prev; kept++;
   }
   g_recents = out;
+  gcFrames();
+}
+
+static void makeThumb(const uint8_t* src, uint8_t* out) {
+  memset(out, 0, THUMB_BYTES);
+  for (uint16_t ty = 0; ty < THUMB_H; ty++) {
+    for (uint16_t tx = 0; tx < THUMB_W; tx++) {
+      bool ink = false;
+      for (uint8_t dy = 0; dy < THUMB_DIV && !ink; dy++) {
+        const uint16_t y = ty * THUMB_DIV + dy;
+        if (y >= PANEL_H) break;
+        for (uint8_t dx = 0; dx < THUMB_DIV; dx++) {
+          const uint16_t x = tx * THUMB_DIV + dx;
+          if (x >= PANEL_W) break;
+          if (src[y * CANVAS_STRIDE + (x >> 3)] & (0x80 >> (x & 7))) { ink = true; break; }
+        }
+      }
+      if (ink) out[ty * THUMB_STRIDE + (tx >> 3)] |= 0x80 >> (tx & 7);
+    }
+  }
+}
+
+static bool readFrame(uint32_t id, uint8_t* into) {
+  if (!g_fsReady || !id) return false;
+  File f = LittleFS.open(framePath(id), "r");
+  if (!f) return false;
+  const size_t n = f.read(into, CANVAS_BYTES);
+  f.close();
+  return n == CANVAS_BYTES;
 }
 
 static String recentsJson() {
+  static uint8_t thumb[THUMB_BYTES];
   String j = "[";
   int start = 0; bool first = true;
   while (start < (int)g_recents.length()) {
@@ -818,21 +947,43 @@ static String recentsJson() {
     const int a = rec.indexOf(FLD_SEP);
     const int b = a < 0 ? -1 : rec.indexOf(FLD_SEP, a + 1);
     const int c = b < 0 ? -1 : rec.indexOf(FLD_SEP, b + 1);
-    if (c < 0) continue;
+    const int d = c < 0 ? -1 : rec.indexOf(FLD_SEP, c + 1);
+    if (d < 0) continue;
+    const uint32_t fid = (uint32_t)strtoul(rec.substring(d + 1).c_str(), nullptr, 10);
     if (!first) j += ',';
     first = false;
     j += "{\"mode\":\"";      j += jsonEscape(rec.substring(0, a));
     j += "\",\"text\":\"";    j += jsonEscape(rec.substring(a + 1, b));
     j += "\",\"caption\":\""; j += jsonEscape(rec.substring(b + 1, c));
-    j += "\",\"size\":";      j += rec.substring(c + 1).toInt();
+    j += "\",\"size\":";      j += rec.substring(c + 1, d).toInt();
+    if (fid && readFrame(fid, g_frameBuf)) {
+      makeThumb(g_frameBuf, thumb);
+      j += ",\"thumb\":\"";   j += base64(thumb, THUMB_BYTES); j += "\"";
+    }
     j += "}";
   }
   j += "]";
   return j;
 }
 
+// Hands back the full frame for one recent, so tapping a drawing brings it back
+// at full resolution. Kept out of /api/status because six frames of base64 is
+// 31 KB on every poll, against 2 KB of thumbnails.
+static bool recentFrame(uint16_t index, uint8_t* into) {
+  int start = 0;
+  for (uint16_t i = 0; start < (int)g_recents.length(); i++) {
+    int end = g_recents.indexOf(REC_SEP, start);
+    if (end < 0) end = g_recents.length();
+    if (i == index) return readFrame(recField(g_recents.substring(start, end), 4), into);
+    start = end + 1;
+  }
+  return false;
+}
+
+// `kind` distinguishes the three browser-rendered tabs, which the device cannot
+// tell apart on its own — they all arrive as a bare frame.
 static bool applyContent(Mode mode, const String& text, const String& caption,
-                         uint8_t size, String& err) {
+                         uint8_t size, String& err, const char* kind = "image") {
   QrPlan plan = {0, 0, 0, 0, 0, 0};
   if (!renderToCanvas(canvas, mode, text, caption, size, err, &plan)) return false;
   g_mode    = mode;
@@ -841,7 +992,9 @@ static bool applyContent(Mode mode, const String& text, const String& caption,
   if (mode == MODE_TEXT) g_size = size;
   g_qrPlanValid = (mode == MODE_QR);
   if (g_qrPlanValid) g_qrPlan = plan;
-  pushRecent(mode, text, caption, size);
+  if      (mode == MODE_TEXT)  pushRecent("text", text, "",      size, nullptr);
+  else if (mode == MODE_QR)    pushRecent("qr",   text, caption, size, nullptr);
+  else if (mode == MODE_IMAGE) pushRecent(kind,   text, "",      size, g_image);
   // A clear must leave the glass genuinely blank, so never do it differentially.
   pushCanvas(mode == MODE_NONE);
   saveContent();
@@ -1169,7 +1322,7 @@ static void handleWifiPage() {
 
 static void handleStatus() {
   String j;
-  j.reserve(CANVAS_BYTES * 2 + RECENTS_MAX_LEN + 256);
+  j.reserve(CANVAS_BYTES * 2 + RECENTS_MAX_LEN + RECENTS_MAX * 400 + 512);
   // Every field closes its own quotes and writes its own trailing comma. The
   // previous style left the closing quote to the start of the NEXT line, which
   // reads fine right up until someone inserts a field in the middle: adding
@@ -1196,6 +1349,8 @@ static void handleStatus() {
     j += "\"rssi\":0,";
   }
   if (g_qrPlanValid) { j += "\"qr\":"; j += qrInfoJson(g_qrPlan);     j += ","; }
+  j += "\"thumbW\":";    j += THUMB_W;                              j += ",";
+  j += "\"thumbH\":";    j += THUMB_H;                              j += ",";
   j += "\"recents\":";   j += recentsJson();                        j += ",";
   j += "\"preview\":\""; j += base64(canvas.getBuffer(), CANVAS_BYTES);
   j += "\"}";
@@ -1261,13 +1416,28 @@ static void handleImage() {
   g_haveImage = true;
 
   String err;
-  if (applyContent(MODE_IMAGE, server.arg("text"), "", g_size, err)) sendOk();
-  else                                                               sendErr(err);
+  String kind = server.arg("kind");
+  if (kind != "draw" && kind != "rich" && kind != "image") kind = "image";
+  if (applyContent(MODE_IMAGE, server.arg("text"), "", g_size, err, kind.c_str())) sendOk();
+  else                                                                            sendErr(err);
+}
+
+static void handleRecentFrame() {
+  const int i = server.arg("i").toInt();
+  if (i < 0 || !recentFrame((uint16_t)i, g_frameBuf)) { sendErr("no frame for that entry"); return; }
+  String j;
+  j.reserve(CANVAS_BYTES * 2 + 64);
+  j  = "{\"ok\":true,\"w\":"; j += PANEL_W;
+  j += ",\"h\":";              j += PANEL_H;
+  j += ",\"bits\":\"";         j += base64(g_frameBuf, CANVAS_BYTES);
+  j += "\"}";
+  sendJson(200, j);
 }
 
 static void handleRecents() {
   if (server.arg("clear") == "1") {
     g_recents = "";
+    gcFrames();
     prefs.begin("eink", false); prefs.putString("recents", g_recents); prefs.end();
   }
   sendJson(200, String("{\"ok\":true,\"recents\":") + recentsJson() + "}");
@@ -1333,6 +1503,7 @@ static void serverBegin() {
   server.on("/api/image",   HTTP_POST, handleImage);
   server.on("/api/clear",   HTTP_POST, handleClear);
   server.on("/api/recents", HTTP_POST, handleRecents);
+  server.on("/api/recent",  HTTP_GET,  handleRecentFrame);
   server.on("/api/wifi",    HTTP_POST, handleWifiSave);
   server.onNotFound(handleNotFound);
   server.begin();
@@ -1514,6 +1685,14 @@ void setup() {
 
   displayBegin();
 
+  // The frames behind bitmap recents. Formats on first use, a one-off second or
+  // two. A failure is not fatal: pushRecent() then declines to remember bitmap
+  // entries, exactly as it behaved before this existed.
+  g_fsReady = LittleFS.begin(true);
+  if (g_fsReady) Serial.printf("[fs] mounted, %u of %u bytes used\n",
+                               (unsigned)LittleFS.usedBytes(), (unsigned)LittleFS.totalBytes());
+  else           Serial.println(F("[fs] mount failed — bitmap recents disabled"));
+
   // Seed the NVS namespaces and keys on a virgin chip. Preferences logs an [E]
   // line for every read of a key that does not exist yet, even when the read
   // supplies a default, so writing them once keeps the boot log clean.
@@ -1537,6 +1716,7 @@ void setup() {
 
   // Restore and redraw once — this is a full refresh, per the boot rule.
   loadContent();
+  gcFrames();                       // drop frames orphaned by an interrupted write
   if (g_mode != MODE_NONE) {
     String err;
     QrPlan plan = {0, 0, 0, 0, 0, 0};

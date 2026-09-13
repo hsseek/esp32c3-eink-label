@@ -201,7 +201,7 @@ between them follows from which family you are in.
 | **Font size applies** | yes | no | yes | no |
 | **Preview costs**     | a round trip to the device | a round trip | nothing, the bitmap is local | nothing |
 | **Over serial**       | `TEXT:` | `QR:` | — | — |
-| **Remembered in [Recent](#recent)** | yes | yes | no | no |
+| **Remembered in [Recent](#recent)** | yes | yes | yes | yes |
 | **Edges**             | crisp | crisp | dithered | dithered / crisp |
 
 Three consequences are worth knowing before you pick a tab:
@@ -373,15 +373,38 @@ was always the binding dimension.
 
 ### Recent
 
-The last `RECENTS_MAX` (6) things displayed are kept in NVS and listed under the
-form. Tapping one loads it into the fields **and previews it** — it never prints
-straight off a tap, because a misfire would cost a 2.4 s refresh and the preview
+The last `RECENTS_MAX` (6) things displayed, listed under the form, **all five
+modes included**. Tapping one loads it and **previews it** — never prints
+straight off a tap, because a misfire would cost a 2.4 s refresh while a preview
 leaves the panel alone. The list de-duplicates, so re-showing something moves it
-to the top rather than filling the list with copies.
+to the top instead of filling the list with copies.
 
-**TEXT and QR only.** A browser-rendered frame is 3904 bytes and the whole NVS
-partition is 20 KB, so six of them could not fit; the UNICODE, IMAGE and DRAW
-tabs are not remembered.
+Entries with no text — a drawing, a picture — show a **thumbnail**, since a
+badge alone would make them indistinguishable. Tapping a DRAW entry also loads
+it back into the drawing pad, so a past sketch can be edited rather than only
+reprinted.
+
+**Where it all lives.** Text and QR entries are a few dozen characters and sit in
+NVS with the rest of the settings. A bitmap entry is a 3904-byte frame, and six
+of those will not fit in a 20 KB NVS partition — so the frames go in the
+**filesystem partition instead**, 1.4 MB that the default partition table
+allocates and nothing else uses. Six frames occupy 32 KB of it, **2.3%**,
+measured on the device.
+
+Frames are named by a hash of their own content, which does double duty: an
+identical redraw produces an identical filename and therefore an identical
+record, so de-duplication falls out for free. A sweep after every change deletes
+any frame no entry points at, which covers eviction, de-duplication and a reset
+midway through a write in one place rather than trying to keep two structures in
+step at every edit.
+
+Thumbnails ride along with `/api/status` (248 bytes each, 4× reduction, a cell
+black if *any* pixel under it is — averaging would thin a one-pixel stroke to
+nothing). The full frame is fetched only when you tap, because six frames of
+base64 would be 31 KB on every poll against 2 KB of thumbnails.
+
+If the filesystem ever fails to mount, the firmware says so on the serial log and
+Recent quietly falls back to text and QR only. Nothing else is affected.
 
 ### Updating over Wi-Fi
 
@@ -561,9 +584,10 @@ Everything the web UI does is a plain form POST, so `curl` works just as well.
 | `GET`  | `/api/scan` | | up to 20 nearby networks |
 | `POST` | `/api/preview` | `mode=text\|qr`, `text`, `caption`, `size=1..3` | the rendered frame — **panel untouched** |
 | `POST` | `/api/display` | `mode=text\|qr`, `text`, `caption`, `size=1..3` | `{"ok":true,"changed":bool}` |
-| `POST` | `/api/image` | `bits` (base64, 3904 bytes), `text` (optional source string) | as above |
+| `POST` | `/api/image` | `bits` (base64, 3904 bytes), `text` (optional source string), `kind=rich\|image\|draw` | as above |
 | `POST` | `/api/clear` | | as above |
 | `POST` | `/api/recents` | `clear=1` | the recent list |
+| `GET`  | `/api/recent` | `i=<index>` | the full frame behind one recent entry |
 | `GET` / `POST` | `/update` | firmware upload, password-protected | see below |
 | `POST` | `/api/wifi` | `ssid`, `pass` | saves and reboots |
 

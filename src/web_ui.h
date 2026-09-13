@@ -58,6 +58,8 @@ ul#rec{list-style:none;margin:6px 0 0;padding:0}
 .badge{flex:none;font-size:11px;font-weight:700;letter-spacing:.04em;color:var(--acc);
   border:1px solid var(--acc);border-radius:5px;padding:2px 5px}
 .rectext{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.thumb{flex:none;width:88px;height:auto;background:#fff;border-radius:4px;
+  image-rendering:pixelated;image-rendering:crisp-edges}
 .link{width:auto;margin:0;padding:0;background:none;border:0;color:var(--acc);font:13px inherit}
 #pad{width:100%;height:auto;margin-top:8px;background:#fff;border-radius:8px;
   image-rendering:pixelated;image-rendering:crisp-edges;touch-action:none;cursor:crosshair}
@@ -141,8 +143,9 @@ function say(t,cls){var m=$("#msg");m.textContent=t;m.className=cls||""}
 var panel=null;        // last image known to be on the glass
 var previewed=false;   // canvas is showing an unprinted preview
 
-function paint(b64,w,h){
-  var c=$("#pv");c.width=w;c.height=h;
+function paint(b64,w,h){ paintInto($("#pv"),b64,w,h) }
+function paintInto(c,b64,w,h){
+  c.width=w;c.height=h;
   var ctx=c.getContext("2d"),img=ctx.createImageData(w,h),d=img.data;
   var raw=atob(b64),stride=(w+7)>>3;
   for(var y=0;y<h;y++){
@@ -357,6 +360,7 @@ function load(){
     $("#dim").textContent=j.w+"\u00d7"+j.h;
     if(!previewed){ paint(j.preview,j.w,j.h); $("#now").textContent=cap; }
     if(!previewed) showQr(j.qr);
+    thumbW=j.thumbW||thumbW; thumbH=j.thumbH||thumbH;
     renderRecents(j.recents);
     if(j.mode!=="none"){
       // The device stores both bitmap tabs as one mode; the source string tells
@@ -381,32 +385,62 @@ function load(){
   });
 }
 
-// TEXT and QR only — a browser-rendered frame is 3904 bytes and would not fit
-// six deep in NVS, so the two bitmap tabs are not remembered.
+var BADGE={text:"TEXT",qr:"QR",rich:"UNICODE",image:"IMAGE",draw:"DRAW"};
+var thumbW=63,thumbH=31;
+
+// A drawing has no text to list, so entries backed by a stored frame show a
+// thumbnail instead. The device sends those with the status; the full frame is
+// only fetched when you tap one, because six of them would be 31 KB per poll.
 function renderRecents(list){
   var w=$("#recwrap"),ul=$("#rec");
   if(!list||!list.length){ w.className="card hide"; return }
   w.className="card"; ul.innerHTML="";
-  list.forEach(function(r){
+  list.forEach(function(r,idx){
     var li=document.createElement("li"); li.className="recitem";
-    var b=document.createElement("span"); b.className="badge"; b.textContent=r.mode.toUpperCase();
-    var t=document.createElement("span"); t.className="rectext";
-    t.textContent=r.caption ? r.caption+" \u2014 "+r.text : r.text;
-    li.appendChild(b); li.appendChild(t);
-    li.addEventListener("click",function(){ useRecent(r) });
+    var b=document.createElement("span"); b.className="badge";
+    b.textContent=BADGE[r.mode]||r.mode.toUpperCase();
+    li.appendChild(b);
+    if(r.thumb){
+      var c=document.createElement("canvas"); c.className="thumb";
+      paintInto(c,r.thumb,thumbW,thumbH);
+      li.appendChild(c);
+    }
+    if(r.text||r.caption){
+      var t=document.createElement("span"); t.className="rectext";
+      t.textContent=r.caption ? r.caption+" \u2014 "+r.text : r.text;
+      li.appendChild(t);
+    }
+    li.addEventListener("click",function(){ useRecent(r,idx) });
     ul.appendChild(li);
   });
 }
 
 // Loads it and previews it. Never prints straight off a tap: a misfire would
 // cost a 2.4 s refresh, and the preview leaves the panel alone.
-function useRecent(r){
-  $(r.mode==="qr"?"#m2":"#m1").checked=true;
-  $("#txt").value=r.text;
-  $("#cap").value=r.caption||"";
-  $("#sz").value=r.size;
-  syncMode(); syncCount(); clearPreview();
-  $("#btnpv").click();
+function useRecent(r,idx){
+  if(r.mode==="text"||r.mode==="qr"){
+    $(r.mode==="qr"?"#m2":"#m1").checked=true;
+    $("#txt").value=r.text;
+    $("#cap").value=r.caption||"";
+    $("#sz").value=r.size;
+    syncMode(); syncCount(); clearPreview();
+    $("#btnpv").click();
+    return;
+  }
+  // A stored frame. Pull it back at full resolution and leave it staged, so the
+  // button already says Print to panel and one more tap re-prints it exactly.
+  busy(true); say("fetching\u2026");
+  fetch("/api/recent?i="+idx).then(function(x){return x.json()}).then(function(j){
+    busy(false);
+    if(!j.ok){ say(j.error,"err"); return }
+    $(r.mode==="rich"?"#m3":r.mode==="draw"?"#m5":"#m4").checked=true;
+    if(r.mode==="rich") $("#txt").value=r.text;
+    syncMode(); syncCount();
+    if(r.mode==="draw"){ paintInto(pad,j.bits,j.w,j.h); padStore(); }  // editable again
+    pendingBits=j.bits;
+    paint(j.bits,j.w,j.h);
+    markPreviewed();
+  }).catch(function(){ busy(false); say("request failed","err") });
 }
 
 function busy(b){$("#go").disabled=b;$("#btnpv").disabled=b;$("#clr").disabled=b}
@@ -433,6 +467,7 @@ function doPrint(){
   // Kept only so the page can repopulate its field, and so a reload knows
   // which of the two bitmap tabs produced this frame.
   b.set("text",curMode()==="rich"?$("#txt").value:"");
+  b.set("kind",curMode());          // rich | image | draw — the device cannot tell
   post("/api/image",b,"printed to the panel");
 }
 
