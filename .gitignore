@@ -4,3 +4,6 @@
 .piolibdeps/
 *.bin
 *.elf
+
+# keep the prebuilt image that ships with the repo
+!firmware/*.bin

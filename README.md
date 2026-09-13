@@ -107,6 +107,9 @@ Install [PlatformIO Core](https://docs.platformio.org/en/latest/core/installatio
 python3 -m pip install --user platformio     # or: pipx install platformio
 ```
 
+A prebuilt image is committed at [`firmware/firmware.bin`](firmware/firmware.bin)
+if you would rather just [upload it](#updating-over-wi-fi) than build.
+
 Then, from the project root:
 
 ```bash
@@ -800,10 +803,28 @@ neighbour is easy to miss. Use `SCAN` to see what is busy where you are.
 | 15 / 202 / 204 | handshake / auth failure | genuinely the wrong password |
 | 201    | `NO_AP_FOUND` | wrong SSID, or a 5 GHz-only network |
 
-The firmware treats 2, 15, 202, 204 and 205 as credential failures: it stops the
-STA and holds an AP-only radio so the setup portal stays reachable. Reason 201
-and plain link drops keep retrying with backoff, since those can recover on
-their own.
+Those reason codes are not trustworthy on their own. **2 and 15 are not
+exclusively "wrong password"** — a marginal signal produces them too. This board
+taught us that directly: reason 2 on a perfectly correct password, because it
+[was not radiating cleanly](#the-board-wont-transmit-invisible-ap-or-reason-2-joining-wi-fi)
+at 20 dBm.
+
+So the firmware does not decide from the reason code alone. It records in NVS
+whether the stored credentials have **ever completed a connection**:
+
+| | reason 2 / 15 / 202 / 204 / 205 | reason 201, plain link drops |
+|---|---|---|
+| **never connected** | almost certainly a typo — STA off, AP-only, so the portal is reachable | retry forever with backoff |
+| **has connected before** | must be interference — retry forever, AP raised alongside | retry forever with backoff |
+
+A credential that has worked is never "wrong". Without that distinction a
+distant, congested or rebooting router can park a working label in AP-only mode
+until someone power-cycles it — fine on a desk, useless on a wall.
+
+The flag is cleared on every credential change, so a genuinely mistyped password
+still lands you in the setup portal on the first attempt rather than inheriting
+the previous one's good standing. `STATUS` over serial reports it as
+`creds_proven`.
 
 ### Provisioning Wi-Fi without the AP
 

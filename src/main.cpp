@@ -209,6 +209,15 @@ static DNSServer   dns;
 
 static String   g_ssid, g_pass;
 static bool     g_haveCreds    = false;
+// Set once these exact credentials have completed a connection, and cleared
+// whenever they change. A credential that has worked is never "wrong", so a
+// later auth-shaped failure has to be interference rather than a typo.
+//
+// Every write to "ssid"/"pass" must clear this alongside, or the failure mode
+// runs in reverse: a genuinely mistyped password would inherit the old one's
+// good standing and never raise the setup portal. Three places do it —
+// handleWifiSave(), and the FORGET and WIFI: serial commands.
+static bool     g_credsProven  = false;
 static bool     g_apActive     = false;
 static bool     g_wasConnected = false;
 static uint8_t  g_failures     = 0;
@@ -857,8 +866,9 @@ static void applyTxPower() {
 
 static void loadCreds() {
   prefs.begin("wifi", true);
-  g_ssid = prefs.getString("ssid", "");
-  g_pass = prefs.getString("pass", "");
+  g_ssid       = prefs.getString("ssid", "");
+  g_pass       = prefs.getString("pass", "");
+  g_credsProven = prefs.getBool("proven", false);
   prefs.end();
   g_haveCreds = g_ssid.length() > 0;
 }
@@ -977,6 +987,13 @@ static void netTick() {
       g_failures = 0;
       g_backoff = 5000;
       Serial.printf("[wifi] reconnected, http://%s\n", WiFi.localIP().toString().c_str());
+      if (!g_credsProven) {                 // written once, not on every reconnect
+        g_credsProven = true;
+        prefs.begin("wifi", false);
+        prefs.putBool("proven", true);
+        prefs.end();
+        Serial.println(F("[wifi] credentials confirmed working"));
+      }
       startMDNS();
     }
     return;
@@ -1003,15 +1020,27 @@ static void netTick() {
   // without a serial cable.
   if (g_failures < 3) return;
 
-  if (isAuthFailure(g_lastReason)) {
-    // Wrong password: stop the STA entirely and hold a clean AP-only radio, so
-    // the portal actually sits on AP_CHANNEL where it can be seen.
+  // Reasons 2 and 15 are not exclusively "wrong password" — a marginal signal
+  // produces them too. This board taught us that the hard way: reason 2 on a
+  // perfectly correct password, because it was not radiating cleanly at 20 dBm.
+  // Giving up on them unconditionally means a distant, congested or rebooting
+  // router can park a working label in AP-only mode until someone power-cycles
+  // it, which is no good on a wall. So the test is not what the reason code
+  // says, it is whether these credentials have ever connected.
+  if (isAuthFailure(g_lastReason) && !g_credsProven) {
+    // Never worked: almost certainly a typo. Stop the STA entirely and hold a
+    // clean AP-only radio, so the portal actually sits on AP_CHANNEL where it
+    // can be seen.
     Serial.printf("[wifi] credentials rejected (reason %u) — STA off, AP-only for setup\n",
                   g_lastReason);
     g_staDisabled = true;
     WiFi.disconnect(true);
     startAP(true);
     return;
+  }
+  if (isAuthFailure(g_lastReason)) {
+    Serial.printf("[wifi] reason %u, but these credentials have connected before — "
+                  "treating as interference and still retrying\n", g_lastReason);
   }
   if (!g_apActive) {
     Serial.println(F("[wifi] repeated failures — raising setup AP alongside"));
@@ -1262,6 +1291,7 @@ static void handleWifiSave() {
   prefs.begin("wifi", false);
   prefs.putString("ssid", ssid);
   prefs.putString("pass", pass);
+  prefs.putBool("proven", false);
   prefs.end();
 
   sendOk();
@@ -1301,6 +1331,8 @@ static void serverBegin() {
 
 // Prints what the radio and the content state actually are. Diagnostic only.
 static void printStatus() {
+  Serial.printf("creds_proven=%d sta_disabled=%d last_reason=%u\n",
+                (int)g_credsProven, (int)g_staDisabled, g_lastReason);
   Serial.printf("mode=%d ap_active=%d wifi_mode=%d heap=%u\n",
                 (int)g_mode, (int)g_apActive, (int)WiFi.getMode(), (unsigned)ESP.getFreeHeap());
   Serial.printf("ap_ssid=%s ap_ip=%s ap_mac=%s clients=%u\n",
@@ -1371,6 +1403,7 @@ static void handleSerialLine(String line) {
     prefs.begin("wifi", false);
     prefs.putString("ssid", "");
     prefs.putString("pass", "");
+    prefs.putBool("proven", false);
     prefs.end();
     Serial.println(F("OK credentials cleared — rebooting into setup AP"));
     g_rebootAt = millis() + 300;
@@ -1399,6 +1432,7 @@ static void handleSerialLine(String line) {
     prefs.begin("wifi", false);
     prefs.putString("ssid", ssid);
     prefs.putString("pass", pass);
+    prefs.putBool("proven", false);
     prefs.end();
     Serial.printf("OK saved \"%s\" — rebooting\n", ssid.c_str());
     g_rebootAt = millis() + 300;
@@ -1482,6 +1516,7 @@ void setup() {
     prefs.putString("ssid", "");
     prefs.putString("pass", "");
   }
+  if (!prefs.isKey("proven")) prefs.putBool("proven", false);   // upgrades too
   prefs.end();
 
   // Restore and redraw once — this is a full refresh, per the boot rule.
