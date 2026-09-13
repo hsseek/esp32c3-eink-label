@@ -69,6 +69,18 @@ GxEPD2_BW<EPD_PANEL_CLASS, EPD_PANEL_CLASS::HEIGHT> display(
 static const uint16_t PANEL_W = EPD_PANEL_CLASS::HEIGHT;
 static const uint16_t PANEL_H = EPD_PANEL_CLASS::WIDTH_VISIBLE;
 
+// Which way up. 1 is landscape with the ribbon cable on the right; 3 is the
+// same layout turned 180 degrees, cable on the left. (0 and 2 are portrait and
+// would need PANEL_W/PANEL_H swapped, so stick to 1 or 3.)
+//
+// Nothing else in the firmware cares: the canvas is always 250x122 in reading
+// order and GxEPD2 applies the rotation when the frame is blitted, so the web
+// preview and the stored image are identical either way. Safe on this panel
+// because GxEPD2_BW hands Adafruit_GFX WIDTH_VISIBLE (122) rather than the
+// controller's 128 RAM columns, so the 180-degree mirror lands on the glass
+// and not 6 px off it.
+static const uint8_t PANEL_ROTATION = 3;
+
 // ── Tunables ────────────────────────────────────────────────────────────────
 static const uint8_t  FULL_REFRESH_EVERY = 10;   // partial updates between full ones
 // How long to leave the panel powered after a draw, in ms.
@@ -523,7 +535,7 @@ static void displayBegin() {
   // line at boot is expected and harmless.
   SPI.begin(PIN_EPD_SCK, PIN_EPD_MISO, PIN_EPD_MOSI, PIN_EPD_CS);
   display.init(115200, true, 2, false);
-  display.setRotation(1);                     // landscape, 250 x 122
+  display.setRotation(PANEL_ROTATION);        // landscape, 250 x 122
 }
 
 // Copies the canvas to the panel.

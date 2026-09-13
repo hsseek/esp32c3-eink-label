@@ -79,6 +79,10 @@ No battery, no level shifters, no external supply. Peak draw during a refresh is
 
 MISO is unused — e-paper is write-only.
 
+The panel is mounted cable-to-the-left by default. Flip it with `PANEL_ROTATION`
+in `src/main.cpp`: `1` is cable-right, `3` is cable-left. Only the blit is
+rotated, so the canvas, the stored image and the browser preview are unchanged.
+
 Pins are declared in one block at the top of [`src/main.cpp`](src/main.cpp)
 (`PIN_EPD_*`); nothing else in the project hard-codes a GPIO number.
 
@@ -428,6 +432,7 @@ Tunables at the top of `main.cpp`:
 | Constant | Default | Meaning |
 |----------|---------|---------|
 | `EPD_PANEL_CLASS` | `GxEPD2_213_BN` | [panel revision](#1-wrong-gxepd2-panel-class) |
+| `PANEL_ROTATION` | `3` | which way up — `1` puts the ribbon cable on the right, `3` on the left |
 | `WIFI_TX_DBM` | `11` | [transmit power](#the-board-wont-transmit-invisible-ap-or-reason-2-joining-wi-fi) |
 | `PANEL_KEEP_POWERED_MS` | `0` | [full vs partial refresh](#ghosting-grey-text-or-update-display-doing-nothing) |
 | `FULL_REFRESH_EVERY` | `10` | partial updates between forced full ones |
