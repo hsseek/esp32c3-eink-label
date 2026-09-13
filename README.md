@@ -291,8 +291,8 @@ edge. So this does not depend on how the label is mounted.
 size is the binding constraint depends on which one the scanner is struggling
 with, and the two swap places:
 
-| payload | border 2 | border 1 | scan range |
-|---------|----------|----------|------------|
+| payload | border 2 | border 1 | modelled scan range |
+|---------|----------|----------|---------------------|
 | 12 chars | 4 px cells, 100 px | 5 px cells, 105 px | 92 → **74 cm** ✗ |
 | 82 chars | 2 px cells, 98 px | 3 px cells, 111 px | 41 → **57 cm** ✓ |
 
@@ -305,17 +305,36 @@ So `QR_QUIET_RESCUE` (1 cell) is used **only when it lifts a code off the 2 px
 floor** — payloads of roughly 79–106 characters. Across all 271 lengths that
 rescues 28 and makes none worse.
 
-Measured on the panel, same 85-character payload through three generations of
-this firmware:
+The same 85-character payload through three generations of this firmware:
 
-| | code | cell | border | scan range |
-|---|---|---|---|---|
-| ECC fixed at Medium, border 4 | 82 px | 0.39 mm | 10 cells | 32 cm |
-| all four ECC levels, border 2 | 106 px | 0.39 mm | 4 cells | 40 cm |
-| with the rescue | **111 px** | **0.58 mm** | 1.7 cells | **52–56 cm** |
+| | code | cell | border | modelled | on the bench |
+|---|---|---|---|---|---|
+| ECC fixed at Medium, border 4 | 82 px | 0.39 mm | 10 cells | 32 cm | — |
+| all four ECC levels, border 2 | 106 px | 0.39 mm | 4 cells | 40 cm | — |
+| with the rescue | **111 px** | **0.58 mm** | 1.7 cells | 52–56 cm | **45 cm** |
 
-Net effect on a 60-character link: **66 px → 99 px**, and simulated scan range
-from about 37 cm to about 48 cm.
+Net effect on a 60-character link: **66 px → 99 px**.
+
+### How far these numbers can be trusted
+
+The scan distances above come from a simulated camera — the panel frame
+projected at a given distance for a 12 MP sensor at 70°, softened, given sensor
+noise, then decoded, bisecting for the range that still reads. It is a model,
+and it is optimistic. Checked against a phone on a desk:
+
+| layout | modelled | measured | ratio |
+|--------|----------|----------|-------|
+| v10, 2 px cells, 2-cell border | 34 cm | **30 cm** | 0.88 |
+| v5, 3 px cells, 1-cell border | 52–56 cm | **45 cm** | 0.83 |
+
+**Scale anything modelled here by roughly 0.85.** The ordering has held every
+time — every layout the model ranked higher measured higher — so it is sound for
+choosing between options, and only the absolute figures need discounting.
+
+Worth stating plainly, since the 1-cell border is two below what ISO 18004 asks
+for: it was validated on hardware, not just in the model. A 271-byte code at the
+tightest layout the firmware can produce scans at 30 cm, and the photograph of
+that panel decodes on its own.
 
 When a code does end up at 2 px per cell — above about 107 characters, where
 nothing can be done — the page says so under the preview, because that is the
@@ -364,8 +383,12 @@ Jitter is bounded by the *comfortable* border (`QR_QUIET_MIN`), never by
 whatever the plan settled for. On a rescued code the two collide — there is not
 room for 2 cells on both sides — and the axis is centred instead. Letting jitter
 spend the rescued border hands back the range the bigger cell just bought: an
-85-character code pushed to a 1.0-cell margin read to 34 cm against a dark
-surround, where centred at 1.7 cells it reads to 52 cm.
+85-character code pushed to a 1.0-cell margin modelled at 34 cm against a dark
+surround, where centred at 1.7 cells it models at 52 cm and measures 45 cm.
+
+This one was caught on hardware, not in review: the first build of the rescue
+let jitter spend the border it had just bought back, landing that code *below*
+the version it replaced.
 
 The offset comes from the payload rather than a random number generator, so the
 same content always lands in the same spot. If it moved on every draw the
