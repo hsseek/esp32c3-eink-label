@@ -1170,27 +1170,34 @@ static void handleWifiPage() {
 static void handleStatus() {
   String j;
   j.reserve(CANVAS_BYTES * 2 + RECENTS_MAX_LEN + 256);
-  j  = "{\"mode\":\"";   j += modeName(g_mode);
-  j += "\",\"text\":\""; j += jsonEscape(g_text);
-  j += "\",\"caption\":\""; j += jsonEscape(g_caption);
-  j += "\",\"size\":";   j += g_size;
-  j += ",\"build\":\"";  j += jsonEscape(BUILD_ID);
-  j += ",\"w\":";        j += PANEL_W;
-  j += ",\"h\":";        j += PANEL_H;
-  j += ",\"updates\":";  j += g_updates;
-  j += ",\"ap\":";       j += (g_apActive && WiFi.status() != WL_CONNECTED) ? "true" : "false";
+  // Every field closes its own quotes and writes its own trailing comma. The
+  // previous style left the closing quote to the start of the NEXT line, which
+  // reads fine right up until someone inserts a field in the middle: adding
+  // "build" that way shipped a status endpoint returning invalid JSON, and a
+  // page that reported the label unreachable because r.json() threw.
+  j  = "{";
+  j += "\"mode\":\"";    j += modeName(g_mode);                      j += "\",";
+  j += "\"text\":\"";    j += jsonEscape(g_text);                    j += "\",";
+  j += "\"caption\":\""; j += jsonEscape(g_caption);                 j += "\",";
+  j += "\"build\":\"";   j += jsonEscape(BUILD_ID);                  j += "\",";
+  j += "\"size\":";      j += g_size;                               j += ",";
+  j += "\"w\":";         j += PANEL_W;                              j += ",";
+  j += "\"h\":";         j += PANEL_H;                              j += ",";
+  j += "\"updates\":";   j += g_updates;                            j += ",";
+  j += "\"ap\":";        j += (g_apActive && WiFi.status() != WL_CONNECTED)
+                               ? "true" : "false";                   j += ",";
   if (WiFi.status() == WL_CONNECTED) {
-    j += ",\"ssid\":\""; j += jsonEscape(WiFi.SSID());
-    j += "\",\"ip\":\""; j += WiFi.localIP().toString();
-    j += "\",\"rssi\":"; j += WiFi.RSSI();
+    j += "\"ssid\":\"";  j += jsonEscape(WiFi.SSID());               j += "\",";
+    j += "\"ip\":\"";    j += WiFi.localIP().toString();             j += "\",";
+    j += "\"rssi\":";    j += WiFi.RSSI();                          j += ",";
   } else {
-    j += ",\"ssid\":\""; j += AP_SSID;
-    j += "\",\"ip\":\""; j += WiFi.softAPIP().toString();
-    j += "\",\"rssi\":0";
+    j += "\"ssid\":\"";  j += jsonEscape(AP_SSID);                   j += "\",";
+    j += "\"ip\":\"";    j += WiFi.softAPIP().toString();            j += "\",";
+    j += "\"rssi\":0,";
   }
-  if (g_qrPlanValid) { j += ",\"qr\":"; j += qrInfoJson(g_qrPlan); }
-  j += ",\"recents\":";  j += recentsJson();
-  j += ",\"preview\":\""; j += base64(canvas.getBuffer(), CANVAS_BYTES);
+  if (g_qrPlanValid) { j += "\"qr\":"; j += qrInfoJson(g_qrPlan);     j += ","; }
+  j += "\"recents\":";   j += recentsJson();                        j += ",";
+  j += "\"preview\":\""; j += base64(canvas.getBuffer(), CANVAS_BYTES);
   j += "\"}";
   sendJson(200, j);
 }

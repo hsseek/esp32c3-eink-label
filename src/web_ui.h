@@ -249,7 +249,15 @@ function stale(){
 }
 
 function load(){
-  fetch("/api/status").then(function(r){return r.json()}).then(function(j){
+  // Two very different failures used to print the same message. A malformed
+  // response is not an unreachable label, and saying so cost real debugging.
+  fetch("/api/status").then(function(r){
+    if(!r.ok) throw new Error("HTTP "+r.status);
+    return r.text();
+  }).then(function(t){
+    var j; try{ j=JSON.parse(t) }catch(e){ throw new Error("bad status response: "+e.message) }
+    return j;
+  }).then(function(j){
     var cap = j.mode==="none"
       ? "panel is blank"
       : j.mode.toUpperCase()+" \u00b7 "+j.updates+" update"+(j.updates==1?"":"s")+" since boot";
@@ -270,7 +278,9 @@ function load(){
     $("#net").textContent=j.ap?("AP "+j.ssid+" \u00b7 "+j.ip)
                               :(j.ssid+" \u00b7 "+j.ip+" \u00b7 "+j.rssi+" dBm");
     syncMode();syncCount();
-  }).catch(function(){say("cannot reach the label","err")});
+  }).catch(function(e){
+    say(/^(bad status|HTTP )/.test(e.message) ? e.message : "cannot reach the label","err");
+  });
 }
 
 // TEXT and QR only — a browser-rendered frame is 3904 bytes and would not fit
