@@ -32,6 +32,9 @@ Firmware for an **ESP32-C3 SuperMini** driving a **Waveshare 2.13" e-Paper V4**
 - **QR codes sized for the panel, not for a spec sheet** — the cell size and
   error-correction level are chosen together, and an optional caption fills the
   half of the display a square code can never reach.
+- **Recent list** — the handful of things a label cycles between, one tap away.
+- **Firmware updates over Wi-Fi**, once you have mounted it somewhere a USB
+  cable will not reach.
 - **USB serial fallback** — `TEXT:`, `QR:`, `QRC:`, `CLEAR`, plus Wi-Fi
   provisioning without ever touching the portal.
 - **Panel-safe** — never left under drive voltage in an idle state.
@@ -45,6 +48,7 @@ Firmware for an **ESP32-C3 SuperMini** driving a **Waveshare 2.13" e-Paper V4**
 [Using it](#using-it) ·
 [QR sizing](#how-a-qr-code-is-sized) ·
 [Burn-in](#does-e-paper-burn-in) ·
+[Firmware over Wi-Fi](#updating-over-wi-fi) ·
 [HTTP API](#http-api) ·
 [Layout](#project-layout) ·
 [Field notes](#field-notes) ·
@@ -220,6 +224,10 @@ TEXT:Hello from the desk
 QR:https://example.com/thing
 QRC:Guest Wi-Fi|https://example.com/thing     code plus a caption
 CLEAR
+RECENTS                    list what is remembered
+RECENTS:CLEAR              forget it
+OTAPW:<password>           enable firmware upload over Wi-Fi
+OTAPW:                     disable it again
 WIFI:<ssid>,<password>     save credentials and reboot
 FORGET                     clear credentials, reboot into the setup AP
 RECONNECT                  force an immediate retry, re-enabling the STA
@@ -358,6 +366,52 @@ web UI shows a caption field whenever the QR tab is selected.
 Because the code is confined to the left square, its sizing is unchanged: height
 was always the binding dimension.
 
+### Recent
+
+The last `RECENTS_MAX` (6) things displayed are kept in NVS and listed under the
+form. Tapping one loads it into the fields **and previews it** — it never prints
+straight off a tap, because a misfire would cost a 2.4 s refresh and the preview
+leaves the panel alone. The list de-duplicates, so re-showing something moves it
+to the top rather than filling the list with copies.
+
+**TEXT and QR only.** A browser-rendered frame is 3904 bytes and the whole NVS
+partition is 20 KB, so six of them could not fit; the UNICODE and IMAGE tabs are
+not remembered.
+
+### Updating over Wi-Fi
+
+Once the label is mounted somewhere, reaching its USB port stops being
+convenient. `http://<label>/update` takes a `firmware.bin` from
+`.pio/build/esp32-c3-supermini/` and reboots into it.
+
+**It is off until you set a password**, over USB serial:
+
+```
+OTAPW:<password>          enable, user "admin"
+OTAPW:                    disable again
+```
+
+That is deliberate. Every other endpoint on this server can only change what the
+panel shows; this one replaces the running code, which turns "anyone on the
+Wi-Fi can change my label" into "anyone on the Wi-Fi can run their own code on a
+device inside my network". A default password would be worse than none, because
+nobody would change it — so there isn't one, and the endpoint answers 403 until
+you choose. Credentials are checked when the upload *starts*, not after it
+finishes, so an unauthenticated caller is refused before streaming a megabyte.
+
+Measured on this hardware: 896 KB uploaded and flashed in **4 s**, back online
+**3 s** later. A corrupt or truncated image is rejected and nothing is
+overwritten — the partition table carries two 1.25 MB app slots, and the running
+one is not touched until the new image verifies. Saved Wi-Fi, content and the
+recent list all live in NVS, a different partition again, so they survive.
+
+You can also flash from a shell:
+
+```bash
+curl -u admin:<password> -F "firmware=@.pio/build/esp32-c3-supermini/firmware.bin" \
+     http://eink.local/update
+```
+
 ### Does e-paper burn in?
 
 Not the way OLED does. OLED burn-in is emissive material ageing at different
@@ -460,6 +514,8 @@ Everything the web UI does is a plain form POST, so `curl` works just as well.
 | `POST` | `/api/display` | `mode=text\|qr`, `text`, `caption`, `size=1..3` | `{"ok":true,"changed":bool}` |
 | `POST` | `/api/image` | `bits` (base64, 3904 bytes), `text` (optional source string) | as above |
 | `POST` | `/api/clear` | | as above |
+| `POST` | `/api/recents` | `clear=1` | the recent list |
+| `GET` / `POST` | `/update` | firmware upload, password-protected | see below |
 | `POST` | `/api/wifi` | `ssid`, `pass` | saves and reboots |
 
 ```bash
@@ -502,6 +558,7 @@ Tunables at the top of `main.cpp`:
 | `QR_QUIET_MIN` | `2` | [white border, in cells](#how-a-qr-code-is-sized) |
 | `QR_QUIET_RESCUE` | `1` | [narrower border, only to escape the 2 px floor](#how-a-qr-code-is-sized) |
 | `QR_JITTER_PX` | `8` | [anti-retention offset](#does-e-paper-burn-in) |
+| `RECENTS_MAX` | `6` | how many past items to remember |
 | `AP_SSID` / `AP_CHANNEL` / `HOSTNAME` | `eink-setup` / `11` / `eink` | networking |
 
 ---

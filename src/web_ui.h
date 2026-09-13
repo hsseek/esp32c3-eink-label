@@ -50,6 +50,14 @@ input[type=file]{width:100%;background:#141720;color:var(--mut);border:1px solid
 #msg.err{color:var(--err)} #msg.ok{color:var(--ok)}
 a{color:var(--acc)}
 .hide{display:none}
+ul#rec{list-style:none;margin:6px 0 0;padding:0}
+.recitem{display:flex;align-items:center;gap:9px;padding:10px 6px;cursor:pointer}
+.recitem+.recitem{border-top:1px solid var(--line)}
+.recitem:active{background:#1e2229;border-radius:9px}
+.badge{flex:none;font-size:11px;font-weight:700;letter-spacing:.04em;color:var(--acc);
+  border:1px solid var(--acc);border-radius:5px;padding:2px 5px}
+.rectext{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.link{width:auto;margin:0;padding:0;background:none;border:0;color:var(--acc);font:13px inherit}
 </style></head><body><main>
 
 <h1>e-ink label <span id="dim"></span></h1>
@@ -93,8 +101,17 @@ a{color:var(--acc)}
   <button id="clr" type="button" class="ghost">Clear panel</button>
 </form>
 
+<div class="card hide" id="recwrap">
+  <div class="row">
+    <span class="fld">Recent &mdash; tap to load and preview</span>
+    <button type="button" id="recclr" class="link">Clear</button>
+  </div>
+  <ul id="rec"></ul>
+</div>
+
 <p id="msg"></p>
-<p class="muted"><span id="net">&mdash;</span> &middot; <a href="/wifi">Wi-Fi settings</a></p>
+<p class="muted"><span id="net">&mdash;</span> &middot; <a href="/wifi">Wi-Fi settings</a>
+   &middot; <a href="/update">Firmware</a></p>
 
 <script>
 var $=function(s){return document.querySelector(s)};
@@ -239,6 +256,7 @@ function load(){
     $("#dim").textContent=j.w+"\u00d7"+j.h;
     if(!previewed){ paint(j.preview,j.w,j.h); $("#now").textContent=cap; }
     if(!previewed) showQr(j.qr);
+    renderRecents(j.recents);
     if(j.mode!=="none"){
       // The device stores both bitmap tabs as one mode; the source string tells
       // them apart, since IMAGE never sends one.
@@ -251,6 +269,34 @@ function load(){
                               :(j.ssid+" \u00b7 "+j.ip+" \u00b7 "+j.rssi+" dBm");
     syncMode();syncCount();
   }).catch(function(){say("cannot reach the label","err")});
+}
+
+// TEXT and QR only — a browser-rendered frame is 3904 bytes and would not fit
+// six deep in NVS, so the two bitmap tabs are not remembered.
+function renderRecents(list){
+  var w=$("#recwrap"),ul=$("#rec");
+  if(!list||!list.length){ w.className="card hide"; return }
+  w.className="card"; ul.innerHTML="";
+  list.forEach(function(r){
+    var li=document.createElement("li"); li.className="recitem";
+    var b=document.createElement("span"); b.className="badge"; b.textContent=r.mode.toUpperCase();
+    var t=document.createElement("span"); t.className="rectext";
+    t.textContent=r.caption ? r.caption+" \u2014 "+r.text : r.text;
+    li.appendChild(b); li.appendChild(t);
+    li.addEventListener("click",function(){ useRecent(r) });
+    ul.appendChild(li);
+  });
+}
+
+// Loads it and previews it. Never prints straight off a tap: a misfire would
+// cost a 2.4 s refresh, and the preview leaves the panel alone.
+function useRecent(r){
+  $(r.mode==="qr"?"#m2":"#m1").checked=true;
+  $("#txt").value=r.text;
+  $("#cap").value=r.caption||"";
+  $("#sz").value=r.size;
+  syncMode(); syncCount(); clearPreview();
+  $("#btnpv").click();
 }
 
 function busy(b){$("#go").disabled=b;$("#btnpv").disabled=b;$("#clr").disabled=b}
@@ -320,6 +366,12 @@ $("#btnpv").addEventListener("click",function(){
     }).catch(function(){busy(false);say("request failed","err")});
 });
 
+$("#recclr").addEventListener("click",function(){
+  var b=new URLSearchParams(); b.set("clear","1");
+  fetch("/api/recents",{method:"POST",body:b}).then(function(r){return r.json()})
+    .then(function(j){renderRecents(j.recents);say("recent list cleared","ok")})
+    .catch(function(){say("request failed","err")});
+});
 $("#f").addEventListener("submit",function(e){e.preventDefault();doPrint()});
 $("#clr").addEventListener("click",function(){post("/api/clear",new URLSearchParams(),"panel cleared")});
 $("#m1").addEventListener("change",function(){syncMode();stale()});
@@ -413,3 +465,63 @@ $("#f").addEventListener("submit",function(e){
 scan();
 </script>
 </main></body></html>)HTML";
+
+// ── Firmware upload ─────────────────────────────────────────────────────────
+static const char PAGE_UPDATE[] PROGMEM = R"HTML(
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Update firmware</title>
+<style>
+:root{color-scheme:dark;--bg:#0f1115;--card:#171a21;--fg:#e8eaed;--mut:#9aa0a6;
+  --acc:#4c8dff;--line:#2a2e37}
+body{margin:0;background:var(--bg);color:var(--fg);
+  font:15px/1.45 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+main{max-width:520px;margin:0 auto;padding:18px 16px 40px}
+h1{font-size:19px;margin:4px 0 16px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:14px;margin-bottom:14px}
+.muted{color:var(--mut);font-size:13px;margin:8px 2px 0}
+input[type=file]{width:100%;margin:10px 0}
+button{width:100%;padding:13px;border:0;border-radius:10px;background:var(--acc);
+  color:#fff;font:600 15px inherit;margin-top:8px}
+button:disabled{opacity:.5}
+progress{width:100%;height:8px;margin-top:12px}
+a{color:var(--acc)}
+</style>
+<main>
+<h1>Update firmware</h1>
+<div class="card">
+  <form id="f">
+    <input type="file" id="bin" accept=".bin" required>
+    <button id="go" type="submit">Upload and reboot</button>
+    <progress id="pg" value="0" max="100" hidden></progress>
+  </form>
+  <p class="muted" id="msg">Pick <code>firmware.bin</code> from
+     <code>.pio/build/esp32-c3-supermini/</code>.</p>
+  <p class="muted">The panel keeps whatever it is showing, and saved Wi-Fi and
+     content survive: they live in a different flash partition.</p>
+</div>
+<p class="muted"><a href="/">&larr; back to the label</a></p>
+</main>
+<script>
+var f=document.getElementById("f");
+f.addEventListener("submit",function(e){
+  e.preventDefault();
+  var file=document.getElementById("bin").files[0];
+  if(!file) return;
+  var fd=new FormData(); fd.append("firmware",file,file.name);
+  var pg=document.getElementById("pg"),msg=document.getElementById("msg"),
+      go=document.getElementById("go");
+  pg.hidden=false; go.disabled=true; msg.textContent="uploading\u2026";
+  var x=new XMLHttpRequest();
+  x.open("POST","/update");
+  x.upload.onprogress=function(ev){ if(ev.lengthComputable) pg.value=ev.loaded/ev.total*100 };
+  x.onload=function(){
+    msg.innerHTML = x.status===200
+      ? "done \u2014 rebooting. <a href='/'>back to the label</a> in a few seconds."
+      : "failed ("+x.status+"). Nothing was changed.";
+    go.disabled=false;
+  };
+  x.onerror=function(){ msg.textContent="upload failed \u2014 connection lost"; go.disabled=false };
+  x.send(fd);
+});
+</script>
+)HTML";

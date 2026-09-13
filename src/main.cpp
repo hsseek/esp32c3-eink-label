@@ -9,6 +9,7 @@
 
 #include <Arduino.h>
 #include <SPI.h>
+#include <Update.h>
 #include <WiFi.h>
 #include <WebServer.h>
 #include <DNSServer.h>
@@ -129,6 +130,14 @@ static const uint8_t  QR_MIN_SCALE       = 2;    // px per module; 1 is unscanna
 static const uint8_t  QR_JITTER_PX       = 8;
 static const uint8_t  QR_CAPTION_GAP     = 8;    // px between a code and its caption
 static const uint16_t MAX_CAPTION_LEN    = 60;
+// Recently displayed items, so the handful of things a label cycles between are
+// one tap away instead of retyped on a phone. TEXT and QR only: a browser-
+// rendered frame is 3904 bytes and the whole NVS partition is 20 KB, so six of
+// them would not fit and the two bitmap tabs are excluded.
+static const uint8_t  RECENTS_MAX        = 6;
+static const uint16_t RECENTS_MAX_LEN    = 1800;   // total, in NVS
+static const char     REC_SEP            = '\x1e';  // between records
+static const char     FLD_SEP            = '\x1f';  // between fields
 static const char*    AP_SSID            = "eink-setup";
 // 2.4 GHz channel for the setup AP. Channel 1 is the arduino-esp32 default and
 // is usually the most contended; a beacon from a bare-PCB-antenna board can be
@@ -172,6 +181,15 @@ static bool     g_haveImage = false;
 static Mode     g_mode    = MODE_NONE;
 static String   g_text    = "";
 static String   g_caption = "";         // QR mode only: label drawn beside the code
+
+// Firmware upload password. Every other endpoint can only change what the panel
+// shows; this one replaces the running code, so it is the one thing on this
+// server worth a lock. Empty means the endpoint is off entirely — a default
+// password would be worse than none, since nobody would change it.
+static String   g_recents = "";         // REC_SEP-separated "mode/text/caption/size"
+static String   g_otaPw   = "";
+static bool     g_otaAuthed = false;
+static bool     g_otaFailed = false;
 static uint8_t  g_size    = 2;          // 1 small, 2 medium, 3 large
 static uint32_t g_updates = 0;
 
@@ -668,6 +686,7 @@ static void saveContent() {
   prefs.putUChar("size", g_size);
   prefs.putString("text", g_text);
   prefs.putString("cap", g_caption);
+  prefs.putString("recents", g_recents);
   if (g_mode == MODE_IMAGE && g_haveImage) {
     size_t n = prefs.putBytes("image", g_image, CANVAS_BYTES);
     if (n != CANVAS_BYTES) Serial.printf("[nvs] image save short: %u/%u bytes\n",
@@ -682,6 +701,8 @@ static void loadContent() {
   g_size = prefs.getUChar("size", 2);
   g_text    = prefs.getString("text", "");
   g_caption = prefs.getString("cap", "");
+  g_otaPw   = prefs.getString("otapw", "");
+  g_recents = prefs.getString("recents", "");
   if (g_mode == MODE_IMAGE) {
     g_haveImage = (prefs.getBytesLength("image") == CANVAS_BYTES) &&
                   (prefs.getBytes("image", g_image, CANVAS_BYTES) == CANVAS_BYTES);
@@ -740,6 +761,61 @@ static bool renderToCanvas(GFXcanvas1& c, Mode mode, const String& text,
   return true;
 }
 
+static void stripSeps(String& s) {
+  s.replace(String(REC_SEP), "");
+  s.replace(String(FLD_SEP), "");
+}
+
+// Newest first, de-duplicated, oldest dropped on either count or total length.
+static void pushRecent(Mode m, const String& text, const String& cap, uint8_t size) {
+  if (m != MODE_TEXT && m != MODE_QR) return;
+  String t = text, c = cap;
+  stripSeps(t); stripSeps(c);
+  String rec = String(m == MODE_QR ? "qr" : "text");
+  rec += FLD_SEP; rec += t;
+  rec += FLD_SEP; rec += c;
+  rec += FLD_SEP; rec += size;
+  if (rec.length() > RECENTS_MAX_LEN) return;      // absurdly long, skip it
+
+  String out = rec;
+  uint8_t kept = 1;
+  int start = 0;
+  while (start < (int)g_recents.length() && kept < RECENTS_MAX) {
+    int end = g_recents.indexOf(REC_SEP, start);
+    if (end < 0) end = g_recents.length();
+    const String prev = g_recents.substring(start, end);
+    start = end + 1;
+    if (prev.length() == 0 || prev == rec) continue;          // de-dupe
+    if (out.length() + 1 + prev.length() > RECENTS_MAX_LEN) break;
+    out += REC_SEP; out += prev; kept++;
+  }
+  g_recents = out;
+}
+
+static String recentsJson() {
+  String j = "[";
+  int start = 0; bool first = true;
+  while (start < (int)g_recents.length()) {
+    int end = g_recents.indexOf(REC_SEP, start);
+    if (end < 0) end = g_recents.length();
+    const String rec = g_recents.substring(start, end);
+    start = end + 1;
+    const int a = rec.indexOf(FLD_SEP);
+    const int b = a < 0 ? -1 : rec.indexOf(FLD_SEP, a + 1);
+    const int c = b < 0 ? -1 : rec.indexOf(FLD_SEP, b + 1);
+    if (c < 0) continue;
+    if (!first) j += ',';
+    first = false;
+    j += "{\"mode\":\"";      j += jsonEscape(rec.substring(0, a));
+    j += "\",\"text\":\"";    j += jsonEscape(rec.substring(a + 1, b));
+    j += "\",\"caption\":\""; j += jsonEscape(rec.substring(b + 1, c));
+    j += "\",\"size\":";      j += rec.substring(c + 1).toInt();
+    j += "}";
+  }
+  j += "]";
+  return j;
+}
+
 static bool applyContent(Mode mode, const String& text, const String& caption,
                          uint8_t size, String& err) {
   QrPlan plan = {0, 0, 0, 0, 0, 0};
@@ -750,6 +826,7 @@ static bool applyContent(Mode mode, const String& text, const String& caption,
   if (mode == MODE_TEXT) g_size = size;
   g_qrPlanValid = (mode == MODE_QR);
   if (g_qrPlanValid) g_qrPlan = plan;
+  pushRecent(mode, text, caption, size);
   // A clear must leave the glass genuinely blank, so never do it differentially.
   pushCanvas(mode == MODE_NONE);
   saveContent();
@@ -979,6 +1056,67 @@ static const char* modeName(Mode m) {
   return m == MODE_TEXT ? "text" : (m == MODE_QR ? "qr" : (m == MODE_IMAGE ? "image" : "none"));
 }
 
+// ── Firmware upload ─────────────────────────────────────────────────────────
+// Authentication is checked at UPLOAD_FILE_START rather than in the completion
+// handler: the ESP32 WebServer runs the upload callback while the body streams
+// in, so checking afterwards would mean accepting a megabyte from anyone on the
+// network before saying no.
+static bool otaLocked() {
+  if (g_otaPw.length() == 0) {
+    server.send(403, "text/plain",
+                "Firmware upload is off.\n\n"
+                "Set a password over USB serial first:  OTAPW:<password>\n"
+                "Clear it again with:                   OTAPW:\n");
+    return true;
+  }
+  if (!server.authenticate("admin", g_otaPw.c_str())) {
+    server.requestAuthentication();
+    return true;
+  }
+  return false;
+}
+
+static void handleUpdatePage() {
+  if (otaLocked()) return;
+  server.sendHeader("Cache-Control", "no-store");
+  server.send_P(200, "text/html", PAGE_UPDATE);
+}
+
+static void handleUpdateUpload() {
+  HTTPUpload& up = server.upload();
+  if (up.status == UPLOAD_FILE_START) {
+    g_otaAuthed = (g_otaPw.length() > 0) &&
+                  server.authenticate("admin", g_otaPw.c_str());
+    g_otaFailed = false;
+    if (!g_otaAuthed) return;
+    Serial.printf("[ota] receiving %s\n", up.filename.c_str());
+    if (!Update.begin(UPDATE_SIZE_UNKNOWN)) { Update.printError(Serial); g_otaFailed = true; }
+  } else if (up.status == UPLOAD_FILE_WRITE) {
+    if (!g_otaAuthed || g_otaFailed) return;
+    if (Update.write(up.buf, up.currentSize) != up.currentSize) {
+      Update.printError(Serial); g_otaFailed = true;
+    }
+  } else if (up.status == UPLOAD_FILE_END) {
+    if (!g_otaAuthed || g_otaFailed) return;
+    if (Update.end(true)) Serial.printf("[ota] wrote %u bytes\n", (unsigned)up.totalSize);
+    else { Update.printError(Serial); g_otaFailed = true; }
+  }
+}
+
+static void handleUpdateDone() {
+  if (!g_otaAuthed) { otaLocked(); return; }
+  const bool ok = !g_otaFailed && !Update.hasError();
+  server.sendHeader("Connection", "close");
+  server.send(ok ? 200 : 500, "text/html",
+              ok ? "<meta name=viewport content='width=device-width'>"
+                   "<body style='font:16px system-ui;padding:24px'>"
+                   "<h2>Updated</h2><p>Rebooting. The panel keeps its content.</p>"
+                 : "<meta name=viewport content='width=device-width'>"
+                   "<body style='font:16px system-ui;padding:24px'>"
+                   "<h2>Update failed</h2><p>Nothing was changed. See the serial log.</p>");
+  if (ok) { delay(400); ESP.restart(); }
+}
+
 static void handleRoot() {
   if (!g_haveCreds) {                     // first boot: go straight to setup
     server.sendHeader("Location", "/wifi");
@@ -996,7 +1134,7 @@ static void handleWifiPage() {
 
 static void handleStatus() {
   String j;
-  j.reserve(CANVAS_BYTES * 2);
+  j.reserve(CANVAS_BYTES * 2 + RECENTS_MAX_LEN + 256);
   j  = "{\"mode\":\"";   j += modeName(g_mode);
   j += "\",\"text\":\""; j += jsonEscape(g_text);
   j += "\",\"caption\":\""; j += jsonEscape(g_caption);
@@ -1015,6 +1153,7 @@ static void handleStatus() {
     j += "\",\"rssi\":0";
   }
   if (g_qrPlanValid) { j += ",\"qr\":"; j += qrInfoJson(g_qrPlan); }
+  j += ",\"recents\":";  j += recentsJson();
   j += ",\"preview\":\""; j += base64(canvas.getBuffer(), CANVAS_BYTES);
   j += "\"}";
   sendJson(200, j);
@@ -1083,6 +1222,14 @@ static void handleImage() {
   else                                                               sendErr(err);
 }
 
+static void handleRecents() {
+  if (server.arg("clear") == "1") {
+    g_recents = "";
+    prefs.begin("eink", false); prefs.putString("recents", g_recents); prefs.end();
+  }
+  sendJson(200, String("{\"ok\":true,\"recents\":") + recentsJson() + "}");
+}
+
 static void handleClear() {
   String err;
   if (applyContent(MODE_NONE, "", "", g_size, err)) sendOk();
@@ -1131,6 +1278,8 @@ static void handleNotFound() {
 }
 
 static void serverBegin() {
+  server.on("/update",      HTTP_GET,  handleUpdatePage);
+  server.on("/update",      HTTP_POST, handleUpdateDone, handleUpdateUpload);
   server.on("/",            HTTP_GET,  handleRoot);
   server.on("/wifi",        HTTP_GET,  handleWifiPage);
   server.on("/api/status",  HTTP_GET,  handleStatus);
@@ -1139,6 +1288,7 @@ static void serverBegin() {
   server.on("/api/display", HTTP_POST, handleDisplay);
   server.on("/api/image",   HTTP_POST, handleImage);
   server.on("/api/clear",   HTTP_POST, handleClear);
+  server.on("/api/recents", HTTP_POST, handleRecents);
   server.on("/api/wifi",    HTTP_POST, handleWifiSave);
   server.onNotFound(handleNotFound);
   server.begin();
@@ -1255,6 +1405,22 @@ static void handleSerialLine(String line) {
     return;
   } else if (line.equalsIgnoreCase("CLEAR")) {
     ok = applyContent(MODE_NONE, "", "", g_size, err);
+  } else if (line.equalsIgnoreCase("RECENTS")) {
+    Serial.println(g_recents.length() ? recentsJson() : "[]");
+    return;
+  } else if (line.equalsIgnoreCase("RECENTS:CLEAR")) {
+    g_recents = "";
+    prefs.begin("eink", false); prefs.putString("recents", ""); prefs.end();
+    Serial.println(F("OK recents cleared"));
+    return;
+  } else if (line.startsWith("OTAPW:")) {
+    g_otaPw = line.substring(6);
+    g_otaPw.trim();
+    prefs.begin("eink", false); prefs.putString("otapw", g_otaPw); prefs.end();
+    Serial.println(g_otaPw.length()
+      ? "OK firmware upload enabled at http://eink.local/update (user \"admin\")"
+      : "OK firmware upload disabled");
+    return;
   } else if (line.startsWith("TEXT:")) {
     ok = applyContent(MODE_TEXT, line.substring(5), "", g_size, err);
   } else if (line.startsWith("QRC:")) {
@@ -1307,6 +1473,8 @@ void setup() {
     prefs.putUChar("size", 2);
     prefs.putString("text", "");
     prefs.putString("cap", "");
+    prefs.putString("otapw", "");
+    prefs.putString("recents", "");
   }
   prefs.end();
   prefs.begin("wifi", false);
