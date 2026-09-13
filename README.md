@@ -20,10 +20,11 @@ Firmware for an **ESP32-C3 SuperMini** driving a **Waveshare 2.13" e-Paper V4**
 **Features**
 
 - **Web UI served from PROGMEM** — no CDN, no npm, no internet. One HTML string.
-- **Four modes, two rendered on the device and two by your phone** — TEXT
+- **Five modes, two rendered on the device and three by your phone** — TEXT
   (word-wrapped, 3 sizes) and QR (auto version + scaling) render in firmware;
-  UNICODE (emoji and any script) and IMAGE (any picture, dithered to 1 bit)
-  are rasterised by the browser. [What that changes](#where-each-mode-renders).
+  UNICODE (emoji and any script), IMAGE (any picture, dithered to 1 bit) and
+  DRAW (finger sketching) are rasterised by the browser.
+  [What that changes](#where-each-mode-renders).
 - **Pixel-exact preview** before you spend a refresh — the device renders into a
   scratch buffer and ships the real bitmap back to the browser.
 - **Content survives reboots** — stored in NVS, redrawn once on boot.
@@ -167,7 +168,7 @@ showing its last content the whole time.
 **Web UI** — open the label's address:
 
 - text field for the content
-- **TEXT / QR / UNICODE / IMAGE** tabs, each with exactly one input
+- **TEXT / QR / UNICODE / IMAGE / DRAW** tabs, each with exactly one input
 - font size small / medium / large
 - **Preview** — renders and shows the result in the page *without touching the
   panel*, so you can check the wrap, the truncation or the QR size before
@@ -190,17 +191,18 @@ same thing.
 The four tabs fall into two families, and almost every behavioural difference
 between them follows from which family you are in.
 
-|                       | TEXT | QR | UNICODE | IMAGE |
-|-----------------------|------|----|---------|-------|
+|                       | TEXT | QR | UNICODE | IMAGE / DRAW |
+|-----------------------|------|----|---------|--------------|
 | **Rendered by**       | the device | the device | your browser | your browser |
-| **Glyph source**      | 5 × 7 ASCII table in flash | QR modules | your phone's whole font stack | the picture you pick |
+| **Source**            | 5 × 7 ASCII table in flash | QR modules | your phone's whole font stack | a picture, or your finger |
 | **Character range**   | ASCII 32–126, everything else becomes `?` | any bytes | anything Unicode | n/a |
 | **Stored in NVS as**  | the string | the string | a 3904-byte frame | a 3904-byte frame |
 | **On boot**           | re-rendered | re-rendered | blitted as-is | blitted as-is |
 | **Font size applies** | yes | no | yes | no |
 | **Preview costs**     | a round trip to the device | a round trip | nothing, the bitmap is local | nothing |
 | **Over serial**       | `TEXT:` | `QR:` | — | — |
-| **Edges**             | crisp | crisp | dithered | dithered |
+| **Remembered in [Recent](#recent)** | yes | yes | no | no |
+| **Edges**             | crisp | crisp | dithered | dithered / crisp |
 
 Three consequences are worth knowing before you pick a tab:
 
@@ -252,7 +254,7 @@ Oversized payloads are refused with a message rather than drawn as garbage:
 |------|-------|
 | TEXT | 400 characters (`MAX_TEXT_LEN`). Text that wraps past the panel height is truncated with `...` |
 | QR   | **271 bytes.** Shorter payloads get larger cells — see [how a QR code is sized](#how-a-qr-code-is-sized) |
-| UNICODE / IMAGE | exactly 3904 bytes once decoded (250 × 122, 1 bit per pixel). Anything else is rejected |
+| UNICODE / IMAGE / DRAW | exactly 3904 bytes once decoded (250 × 122, 1 bit per pixel). Anything else is rejected |
 
 ### How a QR code is sized
 
@@ -378,8 +380,8 @@ leaves the panel alone. The list de-duplicates, so re-showing something moves it
 to the top rather than filling the list with copies.
 
 **TEXT and QR only.** A browser-rendered frame is 3904 bytes and the whole NVS
-partition is 20 KB, so six of them could not fit; the UNICODE and IMAGE tabs are
-not remembered.
+partition is 20 KB, so six of them could not fit; the UNICODE, IMAGE and DRAW
+tabs are not remembered.
 
 ### Updating over Wi-Fi
 
@@ -433,6 +435,29 @@ curl -u admin:<password> -F "firmware=@.pio/build/esp32-c3-supermini/firmware.bi
      http://eink.local/update
 ```
 
+### Draw
+
+A 250 × 122 canvas with a pen, an eraser, undo and a brush size. The backing
+store is the panel's own resolution, so the pixels you touch are literally the
+pixels that get sent — there is no resampling step to soften or shift a stroke,
+and the preview is the drawing itself.
+
+**Line art is thresholded, not dithered.** Everything else browser-rendered goes
+through Floyd–Steinberg, which is right for a photo or a coloured emoji but
+wrong here: a pen stroke is solid black with antialiased edges, and diffusing
+those edges speckles every line. Measured on a synthetic stroke, thresholding
+gives 3.5× fewer black/white transitions along it — the difference between a
+line and a dotted line. A uniform grey area shows it most starkly: dithered it
+becomes 30,000 transitions of checkerboard, thresholded it is solid.
+
+The sketch is kept in `localStorage` so a reload does not lose it. That is
+per-browser and never leaves your phone; the panel only ever receives the
+finished frame.
+
+Because DRAW and IMAGE both store as a bare frame, the device cannot tell them
+apart on reload — the page remembers which tab you were last on and returns you
+to it.
+
 ### Does e-paper burn in?
 
 Not the way OLED does. OLED burn-in is emissive material ageing at different
@@ -483,12 +508,13 @@ The device has no glyph data beyond a 5 × 7 ASCII table, so **TEXT mode folds
 anything outside ASCII 32–126 to `?`** — emoji, Hangul, accented Latin. QR mode
 is unaffected, since it encodes raw bytes.
 
-Two tabs sidestep the problem by rasterising in the browser, which already has
+Three tabs sidestep the problem by rasterising in the browser, which already has
 every font and emoji on the phone:
 
 - **UNICODE** — type anything, including emoji and Hangul. The page lays it out
   with your phone's own fonts at the chosen size.
 - **IMAGE** — pick a picture. Scaled to fit and centred.
+- **DRAW** — sketch with your finger. See [below](#draw).
 
 Each tab has exactly one input, so there is nothing to reset when switching. The
 result goes onto a 250 × 122 canvas, is converted to 1 bit with Floyd–Steinberg

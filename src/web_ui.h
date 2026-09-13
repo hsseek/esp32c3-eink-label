@@ -25,9 +25,10 @@ h1 span{color:var(--mut);font-weight:400}
 #pv{width:100%;height:auto;image-rendering:pixelated;image-rendering:crisp-edges}
 .muted{color:var(--mut);font-size:13px;margin:8px 2px 0}
 .muted.warn{color:#e0a44a}
-.seg{display:flex;gap:6px;background:#141720;border:1px solid var(--line);border-radius:10px;padding:4px;margin-bottom:12px}
+.seg{display:flex;flex-wrap:wrap;gap:6px;background:#141720;border:1px solid var(--line);
+  border-radius:10px;padding:4px;margin-bottom:12px}
 .seg input{position:absolute;opacity:0;pointer-events:none}
-.seg label{flex:1;min-width:0;text-align:center;padding:9px 0;border-radius:7px;font-weight:600;
+.seg label{flex:1 1 0;min-width:62px;text-align:center;padding:9px 0;border-radius:7px;font-weight:600;
   font-size:13px;letter-spacing:.01em;white-space:nowrap;color:var(--mut);cursor:pointer;user-select:none}
 .seg input:checked+label{background:var(--acc);color:#fff}
 input[type=text]{width:100%;background:#141720;color:var(--fg);border:1px solid var(--line);
@@ -58,6 +59,13 @@ ul#rec{list-style:none;margin:6px 0 0;padding:0}
   border:1px solid var(--acc);border-radius:5px;padding:2px 5px}
 .rectext{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .link{width:auto;margin:0;padding:0;background:none;border:0;color:var(--acc);font:13px inherit}
+#pad{width:100%;height:auto;margin-top:8px;background:#fff;border-radius:8px;
+  image-rendering:pixelated;image-rendering:crisp-edges;touch-action:none;cursor:crosshair}
+.tools{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin-top:8px}
+.tool{width:auto;margin:0;padding:7px 11px;font-size:13px;font-weight:600;background:transparent;
+  border:1px solid var(--line);color:var(--mut);border-radius:8px}
+.tool.on{border-color:var(--acc);color:var(--acc)}
+.tools input[type=range]{flex:1 1 90px;margin:0;accent-color:var(--acc)}
 </style></head><body><main>
 
 <h1>e-ink label <span id="dim"></span></h1>
@@ -74,6 +82,7 @@ ul#rec{list-style:none;margin:6px 0 0;padding:0}
     <input type="radio" name="mode" id="m2" value="qr"><label for="m2">QR</label>
     <input type="radio" name="mode" id="m3" value="rich"><label for="m3">UNICODE</label>
     <input type="radio" name="mode" id="m4" value="image"><label for="m4">IMAGE</label>
+    <input type="radio" name="mode" id="m5" value="draw"><label for="m5">DRAW</label>
   </div>
   <div id="txtrow">
     <textarea id="txt" placeholder="What should the label say?" maxlength="400"></textarea>
@@ -95,6 +104,17 @@ ul#rec{list-style:none;margin:6px 0 0;padding:0}
   <div class="hide" id="imgrow">
     <label class="fld" for="file">Picture &mdash; scaled to fit and dithered to 1 bit</label>
     <input type="file" id="file" accept="image/*">
+  </div>
+  <div class="hide" id="drawrow">
+    <label class="fld">Draw &mdash; 250 &times; 122, exactly the pixels the panel gets</label>
+    <canvas id="pad" width="250" height="122"></canvas>
+    <div class="tools">
+      <button type="button" id="pen" class="tool on">Pen</button>
+      <button type="button" id="eraser" class="tool">Eraser</button>
+      <button type="button" id="undo" class="tool">Undo</button>
+      <button type="button" id="wipe" class="tool">Erase all</button>
+      <input type="range" id="brush" min="1" max="12" value="3">
+    </div>
   </div>
   <button id="btnpv" type="button">Preview</button>
   <button id="go" type="submit" class="ghost">Print now</button>
@@ -137,20 +157,23 @@ function paint(b64,w,h){
 }
 
 function curMode(){
-  return $("#m1").checked?"text":$("#m2").checked?"qr":$("#m3").checked?"rich":"image";
+  return $("#m1").checked?"text":$("#m2").checked?"qr":$("#m3").checked?"rich"
+       :$("#m4").checked?"image":"draw";
 }
 // Each tab has exactly one source, so there is never a stale input to clear.
 function syncMode(){
   var m=curMode();
-  $("#txtrow").className=(m==="image")?"hide":"";
+  $("#txtrow").className=(m==="image"||m==="draw")?"hide":"";
   $("#szrow").className=(m==="qr")?"fld hide":"fld";
   $("#caprow").className=(m==="qr")?"":"hide";
   $("#imgrow").className=(m==="image")?"":"hide";
+  $("#drawrow").className=(m==="draw")?"":"hide";
+  try{ localStorage.setItem("tab",m) }catch(e){}
   $("#txt").placeholder = m==="qr" ? "URL or text to encode"
     : m==="rich" ? "Emoji, Hangul, any script your phone can draw"
     : "What should the label say?";
 }
-function isLocal(){var m=curMode();return m==="rich"||m==="image"}
+function isLocal(){var m=curMode();return m==="rich"||m==="image"||m==="draw"}
 
 // ---- IMAGE mode: the phone rasterises, the panel just blits ----------------
 // The device has no glyphs beyond 5x7 ASCII, but this browser already has every
@@ -160,8 +183,70 @@ var W=250,H=122,pic=null,pendingBits=null;
 
 function sizePx(){return {"1":13,"2":19,"3":27}[$("#sz").value]||19}
 
+// ---- DRAW: a 1:1 scratch surface -------------------------------------------
+// The backing store is the panel's own 250x122, so what you draw is literally
+// the bitmap that gets sent — no resampling step to soften or shift a stroke.
+var pad=$("#pad"),pctx=pad.getContext("2d",{willReadFrequently:true}),
+    tool="pen",undoStack=[],drawing=false,lastPt=null;
+
+function padClear(){pctx.fillStyle="#fff";pctx.fillRect(0,0,W,H)}
+padClear();
+// Keep the sketch across reloads; losing it to an accidental refresh would be
+// the most annoying thing about this tab. Per-browser, never sent anywhere.
+function padStore(){try{localStorage.setItem("pad",pad.toDataURL())}catch(e){}}
+(function padRestore(){
+  try{
+    var d=localStorage.getItem("pad");
+    if(!d) return;
+    var im=new Image();
+    im.onload=function(){pctx.drawImage(im,0,0)};
+    im.src=d;
+  }catch(e){}
+})();
+
+function padPos(ev){
+  var r=pad.getBoundingClientRect();
+  return {x:(ev.clientX-r.left)*W/r.width, y:(ev.clientY-r.top)*H/r.height};
+}
+function brushCfg(){
+  pctx.lineCap="round"; pctx.lineJoin="round";
+  pctx.lineWidth=+$("#brush").value;
+  pctx.strokeStyle=pctx.fillStyle=(tool==="pen"?"#000":"#fff");
+}
+function dot(p){brushCfg();pctx.beginPath();pctx.arc(p.x,p.y,pctx.lineWidth/2,0,6.2832);pctx.fill()}
+function seg(a,b){brushCfg();pctx.beginPath();pctx.moveTo(a.x,a.y);pctx.lineTo(b.x,b.y);pctx.stroke()}
+function pushUndo(){
+  undoStack.push(pctx.getImageData(0,0,W,H));
+  if(undoStack.length>12) undoStack.shift();
+}
+pad.addEventListener("pointerdown",function(ev){
+  ev.preventDefault(); pad.setPointerCapture(ev.pointerId);
+  pushUndo(); drawing=true; lastPt=padPos(ev); dot(lastPt);
+});
+pad.addEventListener("pointermove",function(ev){
+  if(!drawing) return;
+  ev.preventDefault();
+  var p=padPos(ev); seg(lastPt,p); lastPt=p;
+});
+["pointerup","pointercancel"].forEach(function(t){
+  pad.addEventListener(t,function(){ if(drawing){drawing=false;padStore();stale()} });
+});
+function setTool(t){
+  tool=t;
+  $("#pen").className="tool"+(t==="pen"?" on":"");
+  $("#eraser").className="tool"+(t==="eraser"?" on":"");
+}
+$("#pen").addEventListener("click",function(){setTool("pen")});
+$("#eraser").addEventListener("click",function(){setTool("eraser")});
+$("#undo").addEventListener("click",function(){
+  var im=undoStack.pop();
+  if(im){pctx.putImageData(im,0,0);padStore();stale()}
+});
+$("#wipe").addEventListener("click",function(){pushUndo();padClear();padStore();stale()});
+
 function drawSource(ctx){
   ctx.fillStyle="#fff";ctx.fillRect(0,0,W,H);
+  if(curMode()==="draw"){ ctx.drawImage(pad,0,0); return; }
   if(curMode()==="image"){
     if(!pic) throw new Error("choose a picture first");
     var s=Math.min(W/pic.width,H/pic.height);
@@ -192,7 +277,12 @@ function drawSource(ctx){
 // Floyd-Steinberg. Plain black text has no error to diffuse so it stays crisp,
 // while a bright emoji or a photo becomes a dot pattern instead of vanishing
 // under a hard threshold.
-function packDithered(ctx){
+//
+// `hard` skips the diffusion, for line art. A drawn stroke is solid black with
+// antialiased edges, and diffusing those edges speckles every line; a threshold
+// keeps them solid. Photos need the opposite, which is why this is a flag and
+// not a decision.
+function packBits(ctx,hard){
   var d=ctx.getImageData(0,0,W,H).data,g=new Float32Array(W*H);
   for(var i=0,p=0;i<d.length;i+=4,p++){
     var a=d[i+3]/255;
@@ -203,11 +293,13 @@ function packDithered(ctx){
   for(var y=0;y<H;y++)for(var x=0;x<W;x++){
     var k=y*W+x,old=g[k],nv=old<128?0:255,err=old-nv;
     g[k]=nv;
-    if(x+1<W) g[k+1]+=err*7/16;
-    if(y+1<H){
-      if(x>0)   g[k+W-1]+=err*3/16;
-      g[k+W]+=err*5/16;
-      if(x+1<W) g[k+W+1]+=err*1/16;
+    if(!hard){
+      if(x+1<W) g[k+1]+=err*7/16;
+      if(y+1<H){
+        if(x>0)   g[k+W-1]+=err*3/16;
+        g[k+W]+=err*5/16;
+        if(x+1<W) g[k+W+1]+=err*1/16;
+      }
     }
     if(nv===0) out[y*stride+(x>>3)]|=0x80>>(x&7);
   }
@@ -218,7 +310,7 @@ function localBits(){
   var c=document.createElement("canvas");c.width=W;c.height=H;
   var ctx=c.getContext("2d",{willReadFrequently:true});
   drawSource(ctx);
-  var u=packDithered(ctx),s="";
+  var u=packBits(ctx,curMode()==="draw"),s="";
   for(var i=0;i<u.length;i++) s+=String.fromCharCode(u[i]);
   return btoa(s);
 }
@@ -269,7 +361,13 @@ function load(){
     if(j.mode!=="none"){
       // The device stores both bitmap tabs as one mode; the source string tells
       // them apart, since IMAGE never sends one.
-      $(j.mode==="qr"?"#m2":j.mode==="image"?(j.text?"#m3":"#m4"):"#m1").checked=true;
+      // IMAGE and DRAW both store as a bare frame, so the device cannot tell
+      // them apart on reload. The last tab used is the better guess.
+      var last=""; try{ last=localStorage.getItem("tab")||"" }catch(e){}
+      var pick = j.mode==="qr" ? "#m2"
+               : j.mode==="image" ? (j.text ? "#m3" : (last==="draw"?"#m5":"#m4"))
+               : "#m1";
+      $(pick).checked=true;
       $("#txt").value=j.text;
       $("#cap").value=j.caption||"";
       $("#sz").value=j.size;
@@ -393,6 +491,7 @@ $("#cap").addEventListener("input",stale);
 $("#txt").addEventListener("input",function(){syncCount();stale()});
 $("#m3").addEventListener("change",function(){syncMode();stale()});
 $("#m4").addEventListener("change",function(){syncMode();stale()});
+$("#m5").addEventListener("change",function(){syncMode();stale()});
 $("#file").addEventListener("change",function(){
   var f=this.files&&this.files[0];
   if(!f){pic=null;stale();return}
