@@ -408,7 +408,25 @@ overwritten — the partition table carries two 1.25 MB app slots, and the runni
 one is not touched until the new image verifies. Saved Wi-Fi, content and the
 recent list all live in NVS, a different partition again, so they survive.
 
-You can also flash from a shell:
+### Knowing what is running
+
+Every build is stamped with a UTC timestamp and the commit it came from:
+
+```
+2026-09-13 14:22Z 831d246
+```
+
+It appears in the boot banner, in `STATUS`, at the foot of the main page, and in
+`/api/status` as `build`. The `/update` page shows the running build above the
+file picker, so reloading it after a reboot tells you whether the upload took —
+which otherwise looks identical to one that silently failed.
+
+A `+` suffix means the tree had uncommitted changes when it was built, so the
+hash alone does not describe what is running. The hash is HEAD *at build time*,
+so a binary committed afterwards names the commit its source came from, not the
+commit containing the binary.
+
+### Flashing from a shell
 
 ```bash
 curl -u admin:<password> -F "firmware=@.pio/build/esp32-c3-supermini/firmware.bin" \
@@ -542,9 +560,11 @@ Anything that draws a QR code also reports how it was sized:
 ## Project layout
 
 ```
-platformio.ini      board, USB-CDC flag, library pins
-src/main.cpp        pin map, panel class, rendering, Wi-Fi, HTTP, serial
-src/web_ui.h        both HTML pages as PROGMEM strings
+platformio.ini        board, USB-CDC flag, library pins
+scripts/build_id.py   stamps each build with a timestamp and commit
+src/main.cpp          pin map, panel class, rendering, Wi-Fi, HTTP, serial
+src/web_ui.h          the three HTML pages as PROGMEM strings
+firmware/firmware.bin prebuilt image, for uploading over the air
 ```
 
 Tunables at the top of `main.cpp`:

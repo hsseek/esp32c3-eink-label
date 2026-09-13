@@ -112,6 +112,7 @@ ul#rec{list-style:none;margin:6px 0 0;padding:0}
 <p id="msg"></p>
 <p class="muted"><span id="net">&mdash;</span> &middot; <a href="/wifi">Wi-Fi settings</a>
    &middot; <a href="/update">Firmware</a></p>
+<p class="muted" id="build">&nbsp;</p>
 
 <script>
 var $=function(s){return document.querySelector(s)};
@@ -265,6 +266,7 @@ function load(){
       $("#cap").value=j.caption||"";
       $("#sz").value=j.size;
     }
+    $("#build").textContent="build "+(j.build||"unknown");
     $("#net").textContent=j.ap?("AP "+j.ssid+" \u00b7 "+j.ip)
                               :(j.ssid+" \u00b7 "+j.ip+" \u00b7 "+j.rssi+" dBm");
     syncMode();syncCount();
@@ -495,13 +497,19 @@ a{color:var(--acc)}
     <progress id="pg" value="0" max="100" hidden></progress>
   </form>
   <p class="muted" id="msg">Pick <code>firmware.bin</code> from
-     <code>.pio/build/esp32-c3-supermini/</code>.</p>
+     <code>.pio/build/esp32-c3-supermini/</code> or <code>firmware/</code>.</p>
+  <p class="muted">Now running: <b id="cur">&hellip;</b><br>
+     Reload this page after it reboots &mdash; if that line changed, the upload took.</p>
   <p class="muted">The panel keeps whatever it is showing, and saved Wi-Fi and
      content survive: they live in a different flash partition.</p>
 </div>
 <p class="muted"><a href="/">&larr; back to the label</a></p>
 </main>
 <script>
+fetch("/api/status").then(function(r){return r.json()}).then(function(j){
+  document.getElementById("cur").textContent=j.build||"unknown";
+}).catch(function(){document.getElementById("cur").textContent="unreachable"});
+
 var f=document.getElementById("f");
 f.addEventListener("submit",function(e){
   e.preventDefault();

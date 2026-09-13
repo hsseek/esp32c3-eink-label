@@ -58,6 +58,12 @@ static const int8_t PIN_EPD_MISO = -1;   // not connected
 //  A wrong class here is the #1 cause of a permanently blank panel: the panel
 //  ACKs nothing, so there is no error — you just get white.
 // ─────────────────────────────────────────────────────────────────────────────
+// Stamped by scripts/build_id.py. The fallback only applies if the pre-script
+// did not run, which would itself be worth knowing.
+#ifndef BUILD_ID
+#define BUILD_ID "unstamped"
+#endif
+
 #define EPD_PANEL_CLASS GxEPD2_213_BN
 
 GxEPD2_BW<EPD_PANEL_CLASS, EPD_PANEL_CLASS::HEIGHT> display(
@@ -1168,6 +1174,7 @@ static void handleStatus() {
   j += "\",\"text\":\""; j += jsonEscape(g_text);
   j += "\",\"caption\":\""; j += jsonEscape(g_caption);
   j += "\",\"size\":";   j += g_size;
+  j += ",\"build\":\"";  j += jsonEscape(BUILD_ID);
   j += ",\"w\":";        j += PANEL_W;
   j += ",\"h\":";        j += PANEL_H;
   j += ",\"updates\":";  j += g_updates;
@@ -1331,6 +1338,7 @@ static void serverBegin() {
 
 // Prints what the radio and the content state actually are. Diagnostic only.
 static void printStatus() {
+  Serial.printf("build=%s\n", BUILD_ID);
   Serial.printf("creds_proven=%d sta_disabled=%d last_reason=%u\n",
                 (int)g_credsProven, (int)g_staDisabled, g_lastReason);
   Serial.printf("mode=%d ap_active=%d wifi_mode=%d heap=%u\n",
@@ -1494,6 +1502,7 @@ void setup() {
   while (!Serial && millis() - t0 < 1500) delay(10);   // USB CDC needs a moment
   Serial.println();
   Serial.println(F("=== Wi-Fi e-ink label ==="));
+  Serial.printf("[fw] build %s\n", BUILD_ID);
   Serial.printf("[epd] panel %ux%u landscape\n", PANEL_W, PANEL_H);
 
   displayBegin();
