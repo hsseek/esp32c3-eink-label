@@ -33,12 +33,18 @@ Firmware for an **ESP32-C3 SuperMini** driving a **Waveshare 2.13" e-Paper V4**
 - **QR codes sized for the panel, not for a spec sheet** — the cell size and
   error-correction level are chosen together, and an optional caption fills the
   half of the display a square code can never reach.
-- **Recent list** — the handful of things a label cycles between, one tap away.
+- **Draw on it with your finger** — a 1:1 sketch pad; the pixels you touch are
+  the pixels the panel gets.
+- **Recent list** — the last six things shown, every mode included, drawings
+  listed by thumbnail. One tap brings any of them back.
 - **Firmware updates over Wi-Fi**, once you have mounted it somewhere a USB
   cable will not reach.
 - **USB serial fallback** — `TEXT:`, `QR:`, `QRC:`, `CLEAR`, plus Wi-Fi
   provisioning without ever touching the portal.
-- **Panel-safe** — never left under drive voltage in an idle state.
+- **Panel-safe** — never left under drive voltage in an idle state, and QR codes
+  are nudged a few pixels between prints so one spot is not worn hardest.
+- **Every build is stamped** with a timestamp and commit, visible in the page
+  footer — so an upload that silently failed does not look like one that worked.
 
 **Contents**
 
@@ -48,8 +54,10 @@ Firmware for an **ESP32-C3 SuperMini** driving a **Waveshare 2.13" e-Paper V4**
 [Wi-Fi setup](#first-time-wi-fi-setup) ·
 [Using it](#using-it) ·
 [QR sizing](#how-a-qr-code-is-sized) ·
+[Draw](#draw) ·
+[Recent](#recent) ·
 [Burn-in](#does-e-paper-burn-in) ·
-[Firmware over Wi-Fi](#updating-over-wi-fi) ·
+[Updating firmware](#updating-firmware) ·
 [HTTP API](#http-api) ·
 [Layout](#project-layout) ·
 [Field notes](#field-notes) ·
@@ -371,6 +379,74 @@ web UI shows a caption field whenever the QR tab is selected.
 Because the code is confined to the left square, its sizing is unchanged: height
 was always the binding dimension.
 
+### Emoji, Hangul and pictures
+
+The device has no glyph data beyond a 5 × 7 ASCII table, so **TEXT mode folds
+anything outside ASCII 32–126 to `?`** — emoji, Hangul, accented Latin. QR mode
+is unaffected, since it encodes raw bytes.
+
+Three tabs sidestep the problem by rasterising in the browser, which already has
+every font and emoji on the phone:
+
+- **UNICODE** — type anything, including emoji and Hangul. The page lays it out
+  with your phone's own fonts at the chosen size.
+- **IMAGE** — pick a picture. Scaled to fit and centred.
+- **DRAW** — sketch with your finger. See [below](#draw).
+
+Each tab has exactly one input, so there is nothing to reset when switching. The
+result goes onto a 250 × 122 canvas, is converted to 1 bit with Floyd–Steinberg
+dithering, and posted as a base64 3904-byte frame. The device decodes, blits and
+stores it in NVS, so it survives a reboot. Nothing is re-rendered on the device,
+and preview for these tabs is instant because the bitmap already exists in the
+browser.
+
+Both tabs store the same device-side mode. The source string tells them apart on
+reload — IMAGE never sends one.
+
+Dithering rather than a hard threshold matters here: a bright yellow emoji is
+high-luminance and would simply disappear under a threshold, but becomes a
+recognisable dot pattern when the error is diffused. Plain black text has no
+error to diffuse, so it stays crisp.
+
+Three things to expect:
+
+- **The panel is 1 bit, so emoji arrive as silhouettes.** High-contrast
+  pictograms (✓ ★ ♥ ⚠ ↑) read well. Detailed or pale ones often do not.
+- **UNICODE and IMAGE are browser-only.** The serial protocol has no way to send
+  a frame, so `TEXT:` and `QR:` remain ASCII-only.
+- **Plain TEXT is still worth using for ASCII.** The device's 5 × 7 bitmap font
+  is crisper on a 1-bit panel than antialiased browser text dithered down to it,
+  and its content round-trips as a string rather than a frame.
+
+To render Hangul from the device itself instead, you would need an Adafruit GFX
+bitmap font containing those glyphs; note that `renderTextToCanvas()` wraps on a
+fixed 6 × 8 cell and would need reworking for a proportional font.
+
+---
+
+### Draw
+
+A 250 × 122 canvas with a pen, an eraser, undo and a brush size. The backing
+store is the panel's own resolution, so the pixels you touch are literally the
+pixels that get sent — there is no resampling step to soften or shift a stroke,
+and the preview is the drawing itself.
+
+**Line art is thresholded, not dithered.** Everything else browser-rendered goes
+through Floyd–Steinberg, which is right for a photo or a coloured emoji but
+wrong here: a pen stroke is solid black with antialiased edges, and diffusing
+those edges speckles every line. Measured on a synthetic stroke, thresholding
+gives 3.5× fewer black/white transitions along it — the difference between a
+line and a dotted line. A uniform grey area shows it most starkly: dithered it
+becomes 30,000 transitions of checkerboard, thresholded it is solid.
+
+The sketch is kept in `localStorage` so a reload does not lose it. That is
+per-browser and never leaves your phone; the panel only ever receives the
+finished frame.
+
+Because DRAW and IMAGE both store as a bare frame, the device cannot tell them
+apart on reload — the page remembers which tab you were last on and returns you
+to it.
+
 ### Recent
 
 The last `RECENTS_MAX` (6) things displayed, listed under the form, **all five
@@ -405,6 +481,56 @@ base64 would be 31 KB on every poll against 2 KB of thumbnails.
 
 If the filesystem ever fails to mount, the firmware says so on the serial log and
 Recent quietly falls back to text and QR only. Nothing else is affected.
+
+### Does e-paper burn in?
+
+Not the way OLED does. OLED burn-in is emissive material ageing at different
+rates per pixel, and it is permanent. E-paper has no emissive layer — nothing is
+being driven continuously, and a static image costs no power at all.
+
+It does have a milder relative. A pattern left in one place for a long time can
+leave a faint residual image as the pigment settles, and an area switched
+repeatedly wears slightly differently from one that never changes. Unlike OLED
+burn-in this is usually recoverable: several full black-to-white refreshes clear
+it. Panel makers ask for a refresh at least once every 24 hours and warn against
+leaving a static image indefinitely, especially when warm.
+
+Two things here address it:
+
+- **Every update is a full refresh** by default (`PANEL_KEEP_POWERED_MS = 0`),
+  which is the same black-to-white cycle used to clear retention.
+- **QR codes are placed with a small pseudo-random offset**, up to
+  `QR_JITTER_PX` (8 px) from centre on each axis, so successive codes do not
+  land on exactly the same pixels.
+
+Jitter is bounded by the *comfortable* border (`QR_QUIET_MIN`), never by
+whatever the plan settled for. On a rescued code the two collide — there is not
+room for 2 cells on both sides — and the axis is centred instead. Letting jitter
+spend the rescued border hands back the range the bigger cell just bought: an
+85-character code pushed to a 1.0-cell margin modelled at 34 cm against a dark
+surround, where centred at 1.7 cells it models at 52 cm and measures 45 cm.
+
+This one was caught on hardware, not in review: the first build of the rescue
+let jitter spend the border it had just bought back, landing that code *below*
+the version it replaced.
+
+The offset comes from the payload rather than a random number generator, so the
+same content always lands in the same spot. If it moved on every draw the
+[unchanged-image check](#update-display-finished-instantly-and-nothing-flashed)
+could never fire and every repeat print would cost a full 2.4 s refresh. It is
+also bounded rather than filling the available slack — a code wandering 70 px
+across the panel reads as a bug, not as care.
+
+**The honest limit:** jitter spreads wear across *content changes*. A label that
+displays one code untouched for six months gets no benefit from it, because
+nothing redraws. If that is your use, a periodic self-refresh on a timer is the
+mitigation that would actually help — it is not implemented.
+
+## Updating firmware
+
+Once the label is mounted somewhere, reaching its USB port stops being
+convenient. These three sections cover getting a new build onto it and
+knowing which one it is running.
 
 ### Updating over Wi-Fi
 
@@ -460,118 +586,6 @@ curl -u admin:<password> -F "firmware=@.pio/build/esp32-c3-supermini/firmware.bi
      http://eink.local/update
 ```
 
-### Draw
-
-A 250 × 122 canvas with a pen, an eraser, undo and a brush size. The backing
-store is the panel's own resolution, so the pixels you touch are literally the
-pixels that get sent — there is no resampling step to soften or shift a stroke,
-and the preview is the drawing itself.
-
-**Line art is thresholded, not dithered.** Everything else browser-rendered goes
-through Floyd–Steinberg, which is right for a photo or a coloured emoji but
-wrong here: a pen stroke is solid black with antialiased edges, and diffusing
-those edges speckles every line. Measured on a synthetic stroke, thresholding
-gives 3.5× fewer black/white transitions along it — the difference between a
-line and a dotted line. A uniform grey area shows it most starkly: dithered it
-becomes 30,000 transitions of checkerboard, thresholded it is solid.
-
-The sketch is kept in `localStorage` so a reload does not lose it. That is
-per-browser and never leaves your phone; the panel only ever receives the
-finished frame.
-
-Because DRAW and IMAGE both store as a bare frame, the device cannot tell them
-apart on reload — the page remembers which tab you were last on and returns you
-to it.
-
-### Does e-paper burn in?
-
-Not the way OLED does. OLED burn-in is emissive material ageing at different
-rates per pixel, and it is permanent. E-paper has no emissive layer — nothing is
-being driven continuously, and a static image costs no power at all.
-
-It does have a milder relative. A pattern left in one place for a long time can
-leave a faint residual image as the pigment settles, and an area switched
-repeatedly wears slightly differently from one that never changes. Unlike OLED
-burn-in this is usually recoverable: several full black-to-white refreshes clear
-it. Panel makers ask for a refresh at least once every 24 hours and warn against
-leaving a static image indefinitely, especially when warm.
-
-Two things here address it:
-
-- **Every update is a full refresh** by default (`PANEL_KEEP_POWERED_MS = 0`),
-  which is the same black-to-white cycle used to clear retention.
-- **QR codes are placed with a small pseudo-random offset**, up to
-  `QR_JITTER_PX` (8 px) from centre on each axis, so successive codes do not
-  land on exactly the same pixels.
-
-Jitter is bounded by the *comfortable* border (`QR_QUIET_MIN`), never by
-whatever the plan settled for. On a rescued code the two collide — there is not
-room for 2 cells on both sides — and the axis is centred instead. Letting jitter
-spend the rescued border hands back the range the bigger cell just bought: an
-85-character code pushed to a 1.0-cell margin modelled at 34 cm against a dark
-surround, where centred at 1.7 cells it models at 52 cm and measures 45 cm.
-
-This one was caught on hardware, not in review: the first build of the rescue
-let jitter spend the border it had just bought back, landing that code *below*
-the version it replaced.
-
-The offset comes from the payload rather than a random number generator, so the
-same content always lands in the same spot. If it moved on every draw the
-[unchanged-image check](#update-display-finished-instantly-and-nothing-flashed)
-could never fire and every repeat print would cost a full 2.4 s refresh. It is
-also bounded rather than filling the available slack — a code wandering 70 px
-across the panel reads as a bug, not as care.
-
-**The honest limit:** jitter spreads wear across *content changes*. A label that
-displays one code untouched for six months gets no benefit from it, because
-nothing redraws. If that is your use, a periodic self-refresh on a timer is the
-mitigation that would actually help — it is not implemented.
-
-### Emoji, Hangul and pictures
-
-The device has no glyph data beyond a 5 × 7 ASCII table, so **TEXT mode folds
-anything outside ASCII 32–126 to `?`** — emoji, Hangul, accented Latin. QR mode
-is unaffected, since it encodes raw bytes.
-
-Three tabs sidestep the problem by rasterising in the browser, which already has
-every font and emoji on the phone:
-
-- **UNICODE** — type anything, including emoji and Hangul. The page lays it out
-  with your phone's own fonts at the chosen size.
-- **IMAGE** — pick a picture. Scaled to fit and centred.
-- **DRAW** — sketch with your finger. See [below](#draw).
-
-Each tab has exactly one input, so there is nothing to reset when switching. The
-result goes onto a 250 × 122 canvas, is converted to 1 bit with Floyd–Steinberg
-dithering, and posted as a base64 3904-byte frame. The device decodes, blits and
-stores it in NVS, so it survives a reboot. Nothing is re-rendered on the device,
-and preview for these tabs is instant because the bitmap already exists in the
-browser.
-
-Both tabs store the same device-side mode. The source string tells them apart on
-reload — IMAGE never sends one.
-
-Dithering rather than a hard threshold matters here: a bright yellow emoji is
-high-luminance and would simply disappear under a threshold, but becomes a
-recognisable dot pattern when the error is diffused. Plain black text has no
-error to diffuse, so it stays crisp.
-
-Three things to expect:
-
-- **The panel is 1 bit, so emoji arrive as silhouettes.** High-contrast
-  pictograms (✓ ★ ♥ ⚠ ↑) read well. Detailed or pale ones often do not.
-- **UNICODE and IMAGE are browser-only.** The serial protocol has no way to send
-  a frame, so `TEXT:` and `QR:` remain ASCII-only.
-- **Plain TEXT is still worth using for ASCII.** The device's 5 × 7 bitmap font
-  is crisper on a 1-bit panel than antialiased browser text dithered down to it,
-  and its content round-trips as a string rather than a frame.
-
-To render Hangul from the device itself instead, you would need an Adafruit GFX
-bitmap font containing those glyphs; note that `renderTextToCanvas()` wraps on a
-fixed 6 × 8 cell and would need reworking for a proportional font.
-
----
-
 ## HTTP API
 
 Everything the web UI does is a plain form POST, so `curl` works just as well.
@@ -618,6 +632,21 @@ src/main.cpp          pin map, panel class, rendering, Wi-Fi, HTTP, serial
 src/web_ui.h          the three HTML pages as PROGMEM strings
 firmware/firmware.bin prebuilt image, for uploading over the air
 ```
+
+Four areas of the 4 MB flash matter, and knowing which is which explains most of
+the storage decisions in this project:
+
+| Area | Size | Holds | Survives |
+|------|------|-------|----------|
+| `app0` / `app1` | 1.25 MB each | the firmware, twice over | — |
+| `nvs` | 20 KB | Wi-Fi credentials, current content, TEXT/QR recents, OTA password | a firmware update |
+| `spiffs` | 1.4 MB | [the frames behind bitmap recents](#recent), 2.3% used | a firmware update |
+| `coredump` | 64 KB | unused | — |
+
+Two app slots are why [an update over Wi-Fi](#updating-firmware) cannot brick the
+board: the running slot is untouched until the new image verifies. The 20 KB NVS
+limit is why a 3904-byte frame cannot live there, and the idle 1.4 MB is where it
+goes instead.
 
 Tunables at the top of `main.cpp`:
 
@@ -909,6 +938,23 @@ WIFI:<ssid>,<password>
 
 Split on the first comma only, so passwords may contain commas (SSIDs may not).
 The device saves to NVS and reboots.
+
+### What the page's error messages mean
+
+The web UI distinguishes three failures that used to look identical, which
+matters because they send you to completely different places:
+
+| Message | Meaning | Where to look |
+|---------|---------|---------------|
+| `cannot reach the label` | the request never completed | Wi-Fi, mDNS, is the board powered |
+| `unreadable reply from /api/... (HTTP nnn)` | the device answered, but not with JSON | the firmware's JSON building; the status code narrows it |
+| anything else | the page's own code threw | the browser console has the stack |
+
+That third row is the one worth knowing about. Earlier versions reported *every*
+failure as `cannot reach the label`, including bugs in the page itself — and a
+malformed `/api/status` once hid behind that message while the device was
+answering every request in under 200 ms. If you see a message that reads like a
+JavaScript error, it is one, and the console has the detail.
 
 ### Nothing at all on serial
 
